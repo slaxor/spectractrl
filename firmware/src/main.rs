@@ -7,9 +7,10 @@ use core::future::pending;
 
 use defmt::{info, warn, Debug2Format};
 use embassy_executor::Spawner;
-use embassy_futures::join::join5;
+use embassy_futures::join::{join, join5};
 use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_rp::bind_interrupts;
+use embassy_rp::gpio::{self, Level, Output, Pull};
 use embassy_rp::peripherals::{UART0, UART1, USB};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::usb::{self, Driver};
@@ -40,27 +41,56 @@ const DEVICE_LINE_END: &[u8] = b"\r";
 const DONE_MARKER: &[u8] = b"ok";
 const FAILED_MARKER: &[u8] = b"?";
 const SETTLE: Duration = Duration::from_millis(500);
+const DEBOUNCE: Duration = Duration::from_millis(20);
 const PACKET: usize = 64;
 const PROMPT: &[u8] = b"> ";
 const DRY_READING: &[u8] = b"0";
+const HELP: &str = concat!(
+    "console\r\n",
+    "  help                  this text\r\n",
+    "  nop                   answers ok\r\n",
+    "  status                per device busy/idle, queue, counters; scan state\r\n",
+    "  allowed sd|ps         whitelisted words with their arguments\r\n",
+    "  sd <forth>            queue a command for the SpectraDrive\r\n",
+    "  ps <forth>            queue a command for the PS-445\r\n",
+    "                        with the unlock jumper closed, sd/ps skip the whitelist\r\n",
+    "  abort sd|ps|scan      stop waiting for a device, or stop the running macro\r\n",
+    "  dry-run <command>     show what an sd, ps or macro command would send, send nothing\r\n",
+    "\r\n",
+    "macros\r\n",
+    "  <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN\r\n",
+    "      GRATING, VOLTS, PMT-ON, then per step GOTO and <reads> x .READ,\r\n",
+    "      one row \"nm,reading,...\" per step, PMT-OFF at the end, also on failure or abort\r\n",
+    "  <grating> <nm> <reads> POINT-MEASURE\r\n",
+    "      the same at a single wavelength, PMT voltage left unchanged\r\n",
+    "\r\n",
+    "numbers\r\n",
+    "  <int> 500   <dec> 300.5, exactly one digit after the point\r\n",
+    "  macros always pass the device whitelist, sd/ps unless the unlock jumper is closed\r\n",
+);
 
 const SPECTRADRIVE_WORDS: &[Word] = &[
-    Word::new(b"WORDS", &[]),
-    Word::new(b"WHO", &[]),
-    Word::new(b"GOTO", &[Arg::Decimal]),
-    Word::new(b"NM", &[Arg::Decimal]),
-    Word::new(b"?NM", &[]),
-    Word::new(b"GRATING", &[Arg::Integer]),
     Word::new(b"?GRATING", &[]),
+    Word::new(b"?NM", &[]),
+    Word::new(b"GOTO", &[Arg::Decimal]),
+    Word::new(b"GRATING", &[Arg::Integer]),
+    Word::new(b"INPUT", &[]),
+    Word::new(b"NM", &[Arg::Decimal]),
+    Word::new(b"STATE", &[]),
+    Word::new(b"WHO", &[]),
+    Word::new(b"WORDS", &[]),
 ];
 
 const PS445_WORDS: &[Word] = &[
-    Word::new(b"WORDS", &[]),
-    Word::new(b"WHO", &[]),
     Word::new(b".READ", &[]),
-    Word::new(b"PMT-ON", &[]),
+    Word::new(b"?VOLTS", &[]),
     Word::new(b"PMT-OFF", &[]),
+    Word::new(b"PMT-ON", &[]),
+    Word::new(b"PMT-RANGE", &[]),
+    Word::new(b"STATE", &[]),
     Word::new(b"VOLTS", &[Arg::Integer]),
+    Word::new(b"WHO", &[]),
+    Word::new(b"WORDS", &[]),
 ];
 
 const PMT_VOLTAGE_WORD: &str = "VOLTS";
@@ -218,6 +248,7 @@ struct Links<'a> {
     spectradrive: &'a Link,
     ps445: &'a Link,
     scan: &'a Scan,
+    unlocked: &'a Cell<bool>,
 }
 
 impl Links<'_> {
@@ -272,7 +303,10 @@ async fn main(_spawner: Spawner) {
     let ps = Link::new(Device::Ps445, PS445_WORDS);
     let scan = Scan::new();
     let events = Events::new();
-    let links = Links { spectradrive: &sd, ps445: &ps, scan: &scan };
+    let unlock_jumper = gpio::Input::new(p.PIN_2, Pull::Up);
+    let unlock_led = Output::new(p.PIN_18, Level::High);
+    let unlocked = Cell::new(false);
+    let links = Links { spectradrive: &sd, ps445: &ps, scan: &scan, unlocked: &unlocked };
 
     let mut config_descriptor = [0u8; 256];
     let mut bos_descriptor = [0u8; 256];
@@ -290,14 +324,30 @@ async fn main(_spawner: Spawner) {
     let mut usb = builder.build();
 
     info!("spectractrl up");
-    join5(
-        usb.run(),
-        serve(&mut console, &links, &events),
-        worker(&sd, spectradrive, &events),
-        worker(&ps, ps445, &events),
-        scanner(&links, &events),
+    join(
+        join5(
+            usb.run(),
+            serve(&mut console, &links, &events),
+            worker(&sd, spectradrive, &events),
+            worker(&ps, ps445, &events),
+            scanner(&links, &events),
+        ),
+        guard(unlock_jumper, unlock_led, &unlocked),
     )
     .await;
+}
+
+async fn guard(mut jumper: gpio::Input<'_>, mut led: Output<'_>, unlocked: &Cell<bool>) -> ! {
+    loop {
+        let closed = jumper.is_low();
+        if closed != unlocked.get() {
+            warn!("whitelist {}", if closed { "bypassed by unlock jumper" } else { "active" });
+        }
+        unlocked.set(closed);
+        led.set_level(if closed { Level::Low } else { Level::High });
+        jumper.wait_for_any_edge().await;
+        Timer::after(DEBOUNCE).await;
+    }
 }
 
 fn uart_config(baudrate: u32) -> uart::Config {
@@ -473,7 +523,9 @@ async fn run_scan(job: &Job, links: &Links<'_>, events: &Events) -> Result<u32, 
     let mode = job.mode;
     emit(events, Kind::Output, format_args!("# {plan}")).await?;
     call(mode, links.spectradrive, events, format_args!("{} GRATING", plan.grating)).await?;
-    call(mode, links.ps445, events, format_args!("{} {}", plan.volts, PMT_VOLTAGE_WORD)).await?;
+    if let Some(volts) = plan.volts {
+        call(mode, links.ps445, events, format_args!("{volts} {PMT_VOLTAGE_WORD}")).await?;
+    }
     let swept = match call(mode, links.ps445, events, format_args!("{PMT_ON_WORD}")).await {
         Ok(_) => sweep(job, links, events).await,
         Err(failure) => Err(failure),
@@ -657,6 +709,11 @@ async fn on_byte(
 
 async fn submit(console: &mut Console<'_>, links: &Links<'_>, line: &mut Line) -> Result<(), Disconnected> {
     write(console, b"\r\n").await?;
+    if line.as_slice() == b"help" {
+        line.clear();
+        write(console, HELP.as_bytes()).await?;
+        return write(console, PROMPT).await;
+    }
     let reply = execute(links, line);
     line.clear();
     if !reply.is_empty() {
@@ -715,20 +772,25 @@ fn dry_run(links: &Links<'_>, line: &[u8]) -> Text {
 
 fn dry_command(links: &Links<'_>, line: &[u8]) -> Text {
     match split_command(line) {
-        (b"sd", command) => preview(links.spectradrive, command),
-        (b"ps", command) => preview(links.ps445, command),
+        (b"sd", command) => preview(links.spectradrive, command, links.unlocked.get()),
+        (b"ps", command) => preview(links.ps445, command, links.unlocked.get()),
         _ => reply(b"usage: dry-run sd|ps <command> | dry-run <scan>"),
     }
 }
 
-fn preview(link: &Link, command: &[u8]) -> Text {
-    match check(command, link.allowed) {
-        Ok(()) => formatted(format_args!(
+fn preview(link: &Link, command: &[u8], unlocked: bool) -> Text {
+    match (unlocked, check(command, link.allowed)) {
+        (false, Err(rejection)) => rejected(link, &rejection),
+        (true, Err(_)) => formatted(format_args!(
+            "would send to {} unchecked: {}",
+            link.device.name(),
+            core::str::from_utf8(command).unwrap_or("<binary>"),
+        )),
+        (_, Ok(())) => formatted(format_args!(
             "would send to {}: {}",
             link.device.name(),
             core::str::from_utf8(command).unwrap_or("<binary>"),
         )),
-        Err(rejection) => rejected(link, &rejection),
     }
 }
 
@@ -750,16 +812,24 @@ fn run_command(links: &Links<'_>, line: &[u8]) -> Text {
             None => reply(b"usage: abort sd|ps|scan"),
         },
         (b"sd" | b"ps", _) if links.scan.active.get() => reply(b"scan running, use abort scan"),
-        (b"sd", command) => enqueue(links.spectradrive, command),
-        (b"ps", command) => enqueue(links.ps445, command),
+        (b"sd", command) => enqueue(links.spectradrive, command, links.unlocked.get()),
+        (b"ps", command) => enqueue(links.ps445, command, links.unlocked.get()),
         _ => reply(b"unknown command"),
     }
 }
 
-fn enqueue(link: &Link, command: &[u8]) -> Text {
-    if let Err(rejection) = check(command, link.allowed) {
-        return rejected(link, &rejection);
+fn enqueue(link: &Link, command: &[u8], unlocked: bool) -> Text {
+    match (unlocked, check(command, link.allowed)) {
+        (false, Err(rejection)) => rejected(link, &rejection),
+        (true, Err(_)) => {
+            warn!("{} unchecked {=[u8]:a}", link.device, command);
+            push(link, command)
+        }
+        (_, Ok(())) => push(link, command),
     }
+}
+
+fn push(link: &Link, command: &[u8]) -> Text {
     let command = Line::from_slice(command).expect("command is part of a line, so it fits");
     match link.requests.try_send(command) {
         Ok(()) if link.is_busy() => reply(b"queued (device busy)"),
@@ -819,6 +889,13 @@ fn status(links: &Links<'_>) -> Text {
         false => "idle",
     };
     if write!(text, "scan {scan_state}\r\n").is_err() {
+        return reply(b"status overflow");
+    }
+    let whitelist_state = match links.unlocked.get() {
+        true => "bypassed (unlock jumper closed)",
+        false => "active",
+    };
+    if write!(text, "whitelist {whitelist_state}\r\n").is_err() {
         return reply(b"status overflow");
     }
     reply(text.trim_end().as_bytes())

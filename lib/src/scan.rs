@@ -5,12 +5,13 @@ use core::ops::RangeInclusive;
 pub type Picometers = i32;
 
 pub const RANGE_SCAN: &[u8] = b"RANGE-SCAN";
+pub const POINT_MEASURE: &[u8] = b"POINT-MEASURE";
 pub const MIN_STEP: Picometers = 100;
 pub const MAX_STEP: Picometers = 100_000;
 pub const MAX_READS: i32 = 100;
 const FRACTION_DIGITS: usize = 1;
 const PICOMETERS_PER_FRACTION_UNIT: Picometers = 100;
-const ARGS: usize = 6;
+const MAX_ARGS: usize = 6;
 
 /// Inclusive wavelength range a grating can reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,14 +32,48 @@ pub struct Limits<'a> {
     pub volts: RangeInclusive<i32>,
 }
 
-/// A validated RANGE-SCAN request.
+/// The macros the console understands, named by their last word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Macro {
+    RangeScan,
+    PointMeasure,
+}
+
+impl Macro {
+    fn from_word(word: &[u8]) -> Option<Self> {
+        match word {
+            _ if word.eq_ignore_ascii_case(RANGE_SCAN) => Some(Macro::RangeScan),
+            _ if word.eq_ignore_ascii_case(POINT_MEASURE) => Some(Macro::PointMeasure),
+            _ => None,
+        }
+    }
+
+    fn arg_count(self) -> usize {
+        match self {
+            Macro::RangeScan => 6,
+            Macro::PointMeasure => 3,
+        }
+    }
+
+    fn usage(self) -> &'static str {
+        match self {
+            Macro::RangeScan => {
+                "usage: <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN"
+            }
+            Macro::PointMeasure => "usage: <grating> <nm> <reads> POINT-MEASURE",
+        }
+    }
+}
+
+/// A validated measurement request; a point measurement has `start == end`.
+/// `volts` is `None` when the PMT voltage is left as it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub grating: i32,
     pub start: Picometers,
     pub end: Picometers,
     pub step: Picometers,
-    pub volts: i32,
+    pub volts: Option<i32>,
     pub reads: i32,
 }
 
@@ -53,6 +88,7 @@ impl Plan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
     Grating,
+    Wavelength,
     Start,
     End,
     Step,
@@ -62,15 +98,15 @@ pub enum Field {
 
 impl Field {
     fn is_wavelength(self) -> bool {
-        matches!(self, Field::Start | Field::End | Field::Step)
+        matches!(self, Field::Wavelength | Field::Start | Field::End | Field::Step)
     }
 }
 
-/// Why a RANGE-SCAN request was refused.
+/// Why a macro request was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScanError {
     NotAScan,
-    Usage,
+    Usage(Macro),
     BadNumber(Field),
     OutOfRange { field: Field, low: i32, high: i32 },
 }
@@ -79,23 +115,24 @@ pub enum ScanError {
 pub struct Nm(pub Picometers);
 
 /// Parses `<grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN`
-/// and validates it against `limits`. Commands not ending in RANGE-SCAN yield
-/// `ScanError::NotAScan`.
+/// or `<grating> <nm> <reads> POINT-MEASURE` and validates it against `limits`.
+/// Commands ending in neither word yield `ScanError::NotAScan`.
 pub fn parse(command: &[u8], limits: &Limits<'_>) -> Result<Plan, ScanError> {
-    let is_scan = tokens(command)
+    let kind = tokens(command)
         .last()
-        .is_some_and(|word| word.eq_ignore_ascii_case(RANGE_SCAN));
-    if !is_scan {
-        return Err(ScanError::NotAScan);
+        .and_then(Macro::from_word)
+        .ok_or(ScanError::NotAScan)?;
+    if tokens(command).count() != kind.arg_count() + 1 {
+        return Err(ScanError::Usage(kind));
     }
-    if tokens(command).count() != ARGS + 1 {
-        return Err(ScanError::Usage);
-    }
-    let mut args: [&[u8]; ARGS] = [&[][..]; ARGS];
-    for (slot, token) in args.iter_mut().zip(tokens(command)) {
+    let mut args: [&[u8]; MAX_ARGS] = [&[][..]; MAX_ARGS];
+    for (slot, token) in args.iter_mut().zip(tokens(command).take(kind.arg_count())) {
         *slot = token;
     }
-    validate(args, limits)
+    match kind {
+        Macro::RangeScan => range_scan(args, limits),
+        Macro::PointMeasure => point_measure(args, limits),
+    }
 }
 
 /// Parses a non-negative decimal with at most one fraction digit into picometers.
@@ -126,7 +163,7 @@ fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
     text.split(u8::is_ascii_whitespace).filter(|token| !token.is_empty())
 }
 
-fn validate(args: [&[u8]; ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError> {
+fn range_scan(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError> {
     let [grating, start, end, step, volts, reads] = args;
     let grating = integer(grating, Field::Grating)?;
     let range = grating_range(grating, limits)?;
@@ -140,7 +177,16 @@ fn validate(args: [&[u8]; ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError>
         *limits.volts.end(),
     )?;
     let reads = within(integer(reads, Field::Reads)?, Field::Reads, 1, MAX_READS)?;
-    Ok(Plan { grating, start, end, step, volts, reads })
+    Ok(Plan { grating, start, end, step, volts: Some(volts), reads })
+}
+
+fn point_measure(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError> {
+    let [grating, nm, reads, ..] = args;
+    let grating = integer(grating, Field::Grating)?;
+    let range = grating_range(grating, limits)?;
+    let nm = within(wavelength(nm, Field::Wavelength)?, Field::Wavelength, range.low, range.high)?;
+    let reads = within(integer(reads, Field::Reads)?, Field::Reads, 1, MAX_READS)?;
+    Ok(Plan { grating, start: nm, end: nm, step: MIN_STEP, volts: None, reads })
 }
 
 fn integer(token: &[u8], field: Field) -> Result<i32, ScanError> {
@@ -177,6 +223,7 @@ impl fmt::Display for Field {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Field::Grating => "grating",
+            Field::Wavelength => "nm",
             Field::Start => "start-nm",
             Field::End => "end-nm",
             Field::Step => "step-nm",
@@ -190,9 +237,7 @@ impl fmt::Display for ScanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ScanError::NotAScan => f.write_str("not a scan"),
-            ScanError::Usage => f.write_str(
-                "usage: <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN",
-            ),
+            ScanError::Usage(kind) => f.write_str(kind.usage()),
             ScanError::BadNumber(field) if field.is_wavelength() => {
                 write!(f, "{field} must be a number with at most one decimal")
             }
@@ -207,16 +252,16 @@ impl fmt::Display for ScanError {
 
 impl fmt::Display for Plan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "grating {}, {}..{} nm, step {} nm, {} V, {} reads per step",
-            self.grating,
-            Nm(self.start),
-            Nm(self.end),
-            Nm(self.step),
-            self.volts,
-            self.reads,
-        )
+        write!(f, "grating {}, ", self.grating)?;
+        match self.start == self.end {
+            true => write!(f, "at {} nm", Nm(self.start))?,
+            false => write!(f, "{}..{} nm, step {} nm", Nm(self.start), Nm(self.end), Nm(self.step))?,
+        }
+        match self.volts {
+            Some(volts) => write!(f, ", {volts} V")?,
+            None => f.write_str(", PMT voltage unchanged")?,
+        }
+        write!(f, ", {} reads per step", self.reads)
     }
 }
 
@@ -231,7 +276,7 @@ mod tests {
     };
 
     fn plan(start: i32, end: i32, step: i32) -> Plan {
-        Plan { grating: 1, start, end, step, volts: 500, reads: 3 }
+        Plan { grating: 1, start, end, step, volts: Some(500), reads: 3 }
     }
 
     #[test]
@@ -240,7 +285,26 @@ mod tests {
             ("not a scan", b"300.0 NM", Err(ScanError::NotAScan)),
             ("valid", b"1 300.0 400.0 0.5 500 3 RANGE-SCAN", Ok(plan(300_000, 400_000, 500))),
             ("integers as nm", b"1 300 400 1 500 3 range-scan", Ok(plan(300_000, 400_000, 1_000))),
-            ("missing argument", b"1 300.0 400.0 0.5 500 RANGE-SCAN", Err(ScanError::Usage)),
+            (
+                "missing argument",
+                b"1 300.0 400.0 0.5 500 RANGE-SCAN",
+                Err(ScanError::Usage(Macro::RangeScan)),
+            ),
+            (
+                "point measure",
+                b"2 300.5 5 point-measure",
+                Ok(Plan { grating: 2, start: 300_500, end: 300_500, step: 100, volts: None, reads: 5 }),
+            ),
+            (
+                "point measure with volts",
+                b"1 300.5 500 5 POINT-MEASURE",
+                Err(ScanError::Usage(Macro::PointMeasure)),
+            ),
+            (
+                "point outside grating",
+                b"2 150.0 5 POINT-MEASURE",
+                Err(ScanError::OutOfRange { field: Field::Wavelength, low: 200_000, high: 1_400_000 }),
+            ),
             (
                 "grating out of range",
                 b"3 300.0 400.0 0.5 500 3 RANGE-SCAN",
@@ -287,6 +351,7 @@ mod tests {
         let cases: &[(&str, Plan, &[i32])] = &[
             ("single point", plan(300_000, 300_000, 500), &[300_000]),
             ("exact end", plan(300_000, 301_000, 500), &[300_000, 300_500, 301_000]),
+            ("point", Plan { volts: None, ..plan(300_500, 300_500, 100) }, &[300_500]),
             ("end not on grid", plan(300_000, 301_000, 400), &[300_000, 300_400, 300_800]),
         ];
         for (name, plan, expected) in cases {
