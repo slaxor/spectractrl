@@ -41,6 +41,7 @@ bind_interrupts!(struct Irqs {
 const SPECTRADRIVE_BAUD: u32 = 9600;
 const PS445_BAUD: u32 = 9600;
 const DEVICE_LINE_END: &[u8] = b"\r";
+const DEVICE_LINE_LIMIT: usize = 79;
 const DONE_MARKER: &[u8] = b"ok";
 const FAILED_MARKER: &[u8] = b"?";
 const SETTLE: Duration = Duration::from_millis(500);
@@ -77,6 +78,7 @@ const HELP: &str = concat!(
     "numbers\r\n",
     "  <int> 500   <dec> 300.5, exactly one digit after the point\r\n",
     "  macros always pass the device whitelist, sd/ps unless the unlock jumper is closed\r\n",
+    "  device lines are limited to 79 characters; split longer Forth over several commands\r\n",
 );
 
 const SPECTRADRIVE_WORDS: &[Word] = &[
@@ -642,6 +644,9 @@ async fn call(mode: Mode, link: &Link, events: &Events, args: fmt::Arguments<'_>
 fn scan_command(link: &Link, args: fmt::Arguments<'_>) -> Result<String<128>, ScanFailure> {
     let mut command: String<128> = String::new();
     command.write_fmt(args)?;
+    if !fits_device_line(command.as_bytes()) {
+        return Err(ScanFailure::Overflow);
+    }
     if check(command.as_bytes(), link.allowed).is_err() {
         warn!("{} rejected scan command {=str}", link.device, command.as_str());
         return Err(ScanFailure::Rejected(link.device));
@@ -906,6 +911,9 @@ fn dry_command(links: &Links<'_>, line: &[u8]) -> Text {
 }
 
 fn preview(link: &Link, command: &[u8], unlocked: bool) -> Text {
+    if !fits_device_line(command) {
+        return too_long(link, command);
+    }
     match (unlocked, check(command, link.allowed)) {
         (false, Err(rejection)) => rejected(link, &rejection),
         (true, Err(_)) => formatted(format_args!(
@@ -945,7 +953,23 @@ fn run_command(links: &Links<'_>, line: &[u8]) -> Text {
     }
 }
 
+fn fits_device_line(command: &[u8]) -> bool {
+    command.len() <= DEVICE_LINE_LIMIT
+}
+
+fn too_long(link: &Link, command: &[u8]) -> Text {
+    formatted(format_args!(
+        "rejected on {}: {} characters, the device reads at most {} per line",
+        link.device.name(),
+        command.len(),
+        DEVICE_LINE_LIMIT,
+    ))
+}
+
 fn enqueue(link: &Link, command: &[u8], unlocked: bool) -> Text {
+    if !fits_device_line(command) {
+        return too_long(link, command);
+    }
     match (unlocked, check(command, link.allowed)) {
         (false, Err(rejection)) => rejected(link, &rejection),
         (true, Err(_)) => {
