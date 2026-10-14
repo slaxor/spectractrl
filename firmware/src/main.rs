@@ -2,13 +2,13 @@
 #![no_main]
 
 use core::cell::{Cell, RefCell};
-use core::fmt::Write as _;
+use core::fmt::{self, Write as _};
 use core::future::pending;
 
 use defmt::{info, warn, Debug2Format};
 use embassy_executor::Spawner;
-use embassy_futures::join::join4;
-use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_futures::join::join5;
+use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::{UART0, UART1, USB};
 use embassy_rp::uart::{self, BufferedUart};
@@ -16,6 +16,7 @@ use embassy_rp::usb::{self, Driver};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::Builder;
@@ -24,6 +25,8 @@ use heapless::{String, Vec};
 use {defmt_rtt as _, panic_probe as _};
 
 use spectractrl::command::{check, Arg, Rejection, Word};
+use spectractrl::scan::{self, parse_reading, Limits, Nm, NmRange, Plan, ScanError};
+use spectractrl::xxd::{self, is_printable, XxdRow};
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
@@ -36,8 +39,10 @@ const PS445_BAUD: u32 = 9600;
 const DEVICE_LINE_END: &[u8] = b"\r";
 const DONE_MARKER: &[u8] = b"ok";
 const FAILED_MARKER: &[u8] = b"?";
+const SETTLE: Duration = Duration::from_millis(500);
 const PACKET: usize = 64;
 const PROMPT: &[u8] = b"> ";
+const DRY_READING: &[u8] = b"0";
 
 const SPECTRADRIVE_WORDS: &[Word] = &[
     Word::new(b"WORDS", &[]),
@@ -58,6 +63,17 @@ const PS445_WORDS: &[Word] = &[
     Word::new(b"VOLTS", &[Arg::Integer]),
 ];
 
+const PMT_VOLTAGE_WORD: &str = "VOLTS";
+const PMT_ON_WORD: &str = "PMT-ON";
+const PMT_OFF_WORD: &str = "PMT-OFF";
+
+const GRATINGS: &[NmRange] = &[
+    NmRange::new(0, 1_400_000),
+    NmRange::new(0, 1_400_000),
+    NmRange::new(0, 1_400_000),
+];
+const SCAN_LIMITS: Limits<'static> = Limits { gratings: GRATINGS, volts: 0..=1000 };
+
 type Console<'d> = CdcAcmClass<'d, Driver<'d, USB>>;
 type Line = Vec<u8, 128>;
 type Text = Vec<u8, 512>;
@@ -68,6 +84,7 @@ type Events = Channel<NoopRawMutex, Event, 8>;
 enum Device {
     SpectraDrive,
     Ps445,
+    Scan,
 }
 
 impl Device {
@@ -75,6 +92,7 @@ impl Device {
         match self {
             Device::SpectraDrive => "sd",
             Device::Ps445 => "ps",
+            Device::Scan => "scan",
         }
     }
 }
@@ -104,12 +122,19 @@ struct Event {
     text: Text,
 }
 
+struct Outcome {
+    kind: Kind,
+    output: Text,
+}
+
 struct Link {
     device: Device,
     allowed: &'static [Word],
     requests: Requests,
     abort: Signal<NoopRawMutex, ()>,
+    finished: Signal<NoopRawMutex, Outcome>,
     current: RefCell<Option<Line>>,
+    last_output: RefCell<Text>,
     sent: Cell<u32>,
     lines: Cell<u32>,
     errors: Cell<u32>,
@@ -122,7 +147,9 @@ impl Link {
             allowed,
             requests: Channel::new(),
             abort: Signal::new(),
+            finished: Signal::new(),
             current: RefCell::new(None),
+            last_output: RefCell::new(Text::new()),
             sent: Cell::new(0),
             lines: Cell::new(0),
             errors: Cell::new(0),
@@ -132,11 +159,65 @@ impl Link {
     fn is_busy(&self) -> bool {
         self.current.borrow().is_some()
     }
+
+    fn is_idle(&self) -> bool {
+        !self.is_busy() && self.requests.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Live,
+    Dry,
+}
+
+struct Job {
+    plan: Plan,
+    mode: Mode,
+}
+
+struct Scan {
+    requests: Channel<NoopRawMutex, Job, 1>,
+    active: Cell<bool>,
+    abort: Cell<bool>,
+}
+
+impl Scan {
+    fn new() -> Self {
+        Self { requests: Channel::new(), active: Cell::new(false), abort: Cell::new(false) }
+    }
+}
+
+enum ScanFailure {
+    Rejected(Device),
+    Unfinished(Device),
+    BadReading,
+    Overflow,
+    Aborted,
+}
+
+impl From<fmt::Error> for ScanFailure {
+    fn from(_: fmt::Error) -> Self {
+        ScanFailure::Overflow
+    }
+}
+
+impl fmt::Display for ScanFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScanFailure::Rejected(device) => write!(f, "command rejected by {} whitelist", device.name()),
+            ScanFailure::Unfinished(device) => write!(f, "{} command did not end with ok", device.name()),
+            ScanFailure::BadReading => f.write_str("no number in .READ output"),
+            ScanFailure::Overflow => f.write_str("line too long"),
+            ScanFailure::Aborted => f.write_str("aborted"),
+        }
+    }
 }
 
 struct Links<'a> {
     spectradrive: &'a Link,
     ps445: &'a Link,
+    scan: &'a Scan,
 }
 
 impl Links<'_> {
@@ -158,6 +239,7 @@ enum Input {
     Abort,
     Byte(u8),
     Error(uart::Error),
+    Settled,
 }
 
 struct Disconnected;
@@ -188,8 +270,9 @@ async fn main(_spawner: Spawner) {
 
     let sd = Link::new(Device::SpectraDrive, SPECTRADRIVE_WORDS);
     let ps = Link::new(Device::Ps445, PS445_WORDS);
+    let scan = Scan::new();
     let events = Events::new();
-    let links = Links { spectradrive: &sd, ps445: &ps };
+    let links = Links { spectradrive: &sd, ps445: &ps, scan: &scan };
 
     let mut config_descriptor = [0u8; 256];
     let mut bos_descriptor = [0u8; 256];
@@ -207,11 +290,12 @@ async fn main(_spawner: Spawner) {
     let mut usb = builder.build();
 
     info!("spectractrl up");
-    join4(
+    join5(
         usb.run(),
         serve(&mut console, &links, &events),
         worker(&sd, spectradrive, &events),
         worker(&ps, ps445, &events),
+        scanner(&links, &events),
     )
     .await;
 }
@@ -235,11 +319,16 @@ fn usb_config() -> embassy_usb::Config<'static> {
 async fn worker(link: &Link, mut port: BufferedUart, events: &Events) -> ! {
     resync(link, &mut port).await;
     let mut line = Text::new();
+    let mut settling = false;
     loop {
-        match next_input(link, &mut port).await {
+        match next_input(link, &mut port, settling).await {
             Input::Request(command) => start(link, &mut port, command, events).await,
-            Input::Abort => abort(link, events),
-            Input::Byte(byte) => on_device_byte(link, &mut line, byte, events),
+            Input::Abort => finish(link, events, Kind::Aborted),
+            Input::Byte(byte) => settling = on_device_byte(link, &mut line, byte, events),
+            Input::Settled => {
+                settling = false;
+                finish(link, events, Kind::Failed);
+            }
             Input::Error(error) => {
                 warn!("{} rx: {}", link.device, Debug2Format(&error));
                 bump(&link.errors);
@@ -248,7 +337,7 @@ async fn worker(link: &Link, mut port: BufferedUart, events: &Events) -> ! {
     }
 }
 
-async fn next_input(link: &Link, port: &mut BufferedUart) -> Input {
+async fn next_input(link: &Link, port: &mut BufferedUart, settling: bool) -> Input {
     let mut byte = [0u8; 1];
     let request = async {
         match link.is_busy() {
@@ -256,12 +345,19 @@ async fn next_input(link: &Link, port: &mut BufferedUart) -> Input {
             false => link.requests.receive().await,
         }
     };
-    let input = select3(request, link.abort.wait(), port.read(&mut byte)).await;
+    let settle = async {
+        match settling {
+            true => Timer::after(SETTLE).await,
+            false => pending::<()>().await,
+        }
+    };
+    let input = select4(request, link.abort.wait(), port.read(&mut byte), settle).await;
     match input {
-        Either3::First(command) => Input::Request(command),
-        Either3::Second(()) => Input::Abort,
-        Either3::Third(Ok(_)) => Input::Byte(byte[0]),
-        Either3::Third(Err(error)) => Input::Error(error),
+        Either4::First(command) => Input::Request(command),
+        Either4::Second(()) => Input::Abort,
+        Either4::Third(Ok(_)) => Input::Byte(byte[0]),
+        Either4::Third(Err(error)) => Input::Error(error),
+        Either4::Fourth(()) => Input::Settled,
     }
 }
 
@@ -293,37 +389,52 @@ async fn send<P: Write>(port: &mut P, command: &[u8]) -> Result<(), P::Error> {
     port.flush().await
 }
 
-fn abort(link: &Link, events: &Events) {
+fn finish(link: &Link, events: &Events, kind: Kind) {
     if let Some(command) = link.current.take() {
-        publish(events, link.device, Kind::Aborted, &command);
+        publish(events, link.device, kind, &command);
+        conclude(link, kind);
     }
 }
 
-fn on_device_byte(link: &Link, line: &mut Text, byte: u8, events: &Events) {
+fn conclude(link: &Link, kind: Kind) {
+    *link.current.borrow_mut() = None;
+    let output = link.last_output.take();
+    link.finished.signal(Outcome { kind, output });
+}
+
+fn remember(link: &Link, text: &[u8]) {
+    *link.last_output.borrow_mut() = Text::from_slice(text).expect("line fits text");
+}
+
+fn on_device_byte(link: &Link, line: &mut Text, byte: u8, events: &Events) -> bool {
     defmt::trace!("{} rx {=[u8]:a}", link.device, &[byte][..]);
     match byte {
-        0 | b'\r' => {}
-        b'\n' => complete_line(link, line, events),
+        0 | b'\r' => false,
+        b'\n' => complete_line(link, line, events) == Some(Kind::Output) && link.is_busy(),
         _ => {
             if line.is_full() {
                 complete_line(link, line, events);
             }
             line.push(byte).expect("line has room after completion");
+            false
         }
     }
 }
 
-fn complete_line(link: &Link, line: &mut Text, events: &Events) {
+fn complete_line(link: &Link, line: &mut Text, events: &Events) -> Option<Kind> {
     let text = line.trim_ascii();
-    if !text.is_empty() {
+    let kind = (!text.is_empty()).then(|| classify(link.is_busy(), text));
+    if let Some(kind) = kind {
         bump(&link.lines);
-        let kind = classify(link.is_busy(), text);
-        if kind != Kind::Output {
-            *link.current.borrow_mut() = None;
-        }
         publish(events, link.device, kind, text);
+        match kind {
+            Kind::Output if link.is_busy() => remember(link, text),
+            Kind::Output => {}
+            _ => conclude(link, kind),
+        }
     }
     line.clear();
+    kind
 }
 
 fn classify(busy: bool, text: &[u8]) -> Kind {
@@ -344,6 +455,115 @@ fn publish(events: &Events, device: Device, kind: Kind, text: &[u8]) {
 
 fn bump(counter: &Cell<u32>) {
     counter.set(counter.get().wrapping_add(1));
+}
+
+async fn scanner(links: &Links<'_>, events: &Events) -> ! {
+    let scan = links.scan;
+    loop {
+        let job = scan.requests.receive().await;
+        scan.abort.set(false);
+        let result = run_scan(&job, links, events).await;
+        scan.active.set(false);
+        report(events, job.mode, result).await;
+    }
+}
+
+async fn run_scan(job: &Job, links: &Links<'_>, events: &Events) -> Result<u32, ScanFailure> {
+    let plan = &job.plan;
+    let mode = job.mode;
+    emit(events, Kind::Output, format_args!("# {plan}")).await?;
+    call(mode, links.spectradrive, events, format_args!("{} GRATING", plan.grating)).await?;
+    call(mode, links.ps445, events, format_args!("{} {}", plan.volts, PMT_VOLTAGE_WORD)).await?;
+    let swept = match call(mode, links.ps445, events, format_args!("{PMT_ON_WORD}")).await {
+        Ok(_) => sweep(job, links, events).await,
+        Err(failure) => Err(failure),
+    };
+    let switched_off = call(mode, links.ps445, events, format_args!("{PMT_OFF_WORD}")).await;
+    let steps = swept?;
+    switched_off?;
+    Ok(steps)
+}
+
+async fn sweep(job: &Job, links: &Links<'_>, events: &Events) -> Result<u32, ScanFailure> {
+    let mode = job.mode;
+
+    let mut steps = 0;
+    for nm in job.plan.steps() {
+        if links.scan.abort.get() {
+            return Err(ScanFailure::Aborted);
+        }
+        let row = measure(job, nm, links, events).await?;
+        if mode == Mode::Live {
+            emit(events, Kind::Output, format_args!("{row}")).await?;
+        }
+        steps += 1;
+    }
+    Ok(steps)
+}
+
+async fn measure(job: &Job, nm: i32, links: &Links<'_>, events: &Events) -> Result<String<512>, ScanFailure> {
+    call(job.mode, links.spectradrive, events, format_args!("{} GOTO", Nm(nm))).await?;
+    let mut row = String::new();
+    write!(row, "{}", Nm(nm))?;
+    for _ in 0..job.plan.reads {
+        let output = call(job.mode, links.ps445, events, format_args!(".READ")).await?;
+        let value = parse_reading(&output).ok_or(ScanFailure::BadReading)?;
+        write!(row, ",{value}")?;
+    }
+    Ok(row)
+}
+
+async fn call(mode: Mode, link: &Link, events: &Events, args: fmt::Arguments<'_>) -> Result<Text, ScanFailure> {
+    let command = scan_command(link, args)?;
+    match mode {
+        Mode::Live => transact(link, &command).await,
+        Mode::Dry => preview_call(link, events, &command).await,
+    }
+}
+
+fn scan_command(link: &Link, args: fmt::Arguments<'_>) -> Result<String<128>, ScanFailure> {
+    let mut command: String<128> = String::new();
+    command.write_fmt(args)?;
+    if check(command.as_bytes(), link.allowed).is_err() {
+        warn!("{} rejected scan command {=str}", link.device, command.as_str());
+        return Err(ScanFailure::Rejected(link.device));
+    }
+    Ok(command)
+}
+
+async fn preview_call(link: &Link, events: &Events, command: &str) -> Result<Text, ScanFailure> {
+    emit(events, Kind::Output, format_args!("{}> {command}", link.device.name())).await?;
+    Ok(reply(DRY_READING))
+}
+
+async fn transact(link: &Link, command: &str) -> Result<Text, ScanFailure> {
+    let line = Line::from_slice(command.as_bytes()).expect("string and line have equal capacity");
+    link.finished.reset();
+    link.requests.send(line).await;
+    let outcome = link.finished.wait().await;
+    match outcome.kind {
+        Kind::Done => Ok(outcome.output),
+        _ => Err(ScanFailure::Unfinished(link.device)),
+    }
+}
+
+async fn emit(events: &Events, kind: Kind, args: fmt::Arguments<'_>) -> Result<(), ScanFailure> {
+    let mut text: String<512> = String::new();
+    text.write_fmt(args)?;
+    let text = Text::from_slice(text.as_bytes()).expect("string and text have equal capacity");
+    events.send(Event { device: Device::Scan, kind, text }).await;
+    Ok(())
+}
+
+async fn report(events: &Events, mode: Mode, result: Result<u32, ScanFailure>) {
+    let reported = match (result, mode) {
+        (Ok(steps), Mode::Live) => emit(events, Kind::Done, format_args!("{steps} steps")).await,
+        (Ok(steps), Mode::Dry) => emit(events, Kind::Done, format_args!("dry run, {steps} steps, nothing sent")).await,
+        (Err(failure), _) => emit(events, Kind::Failed, format_args!("{failure}")).await,
+    };
+    if reported.is_err() {
+        warn!("scan report too long");
+    }
 }
 
 async fn serve(console: &mut Console<'_>, links: &Links<'_>, events: &Events) -> ! {
@@ -383,18 +603,43 @@ async fn step(
             }
             Ok(())
         }
+        Either::Second(event) if is_noise(links, &event) => Ok(()),
         Either::Second(event) => announce(console, &event, line).await,
     }
+}
+
+fn is_noise(links: &Links<'_>, event: &Event) -> bool {
+    links.scan.active.get()
+        && !matches!(event.device, Device::Scan)
+        && matches!(event.kind, Kind::Output | Kind::Done)
 }
 
 async fn announce(console: &mut Console<'_>, event: &Event, line: &Line) -> Result<(), Disconnected> {
     write(console, b"\r\x1b[K[").await?;
     write(console, event.device.name().as_bytes()).await?;
     write(console, event.kind.label()).await?;
-    write(console, &event.text).await?;
+    write(console, &printable(&event.text)).await?;
     write(console, b"\r\n").await?;
+    if !event.text.iter().all(is_printable) {
+        dump(console, &event.text).await?;
+    }
     write(console, PROMPT).await?;
     write(console, line).await
+}
+
+fn printable(text: &[u8]) -> Text {
+    text.iter()
+        .map(|byte| if is_printable(byte) { *byte } else { b'.' })
+        .collect()
+}
+
+async fn dump(console: &mut Console<'_>, bytes: &[u8]) -> Result<(), Disconnected> {
+    for (index, chunk) in bytes.chunks(xxd::WIDTH).enumerate() {
+        let mut row: String<80> = String::new();
+        write!(row, "{}\r\n", XxdRow::new(index * xxd::WIDTH, chunk)).expect("xxd row fits 80 bytes");
+        write(console, row.as_bytes()).await?;
+    }
+    Ok(())
 }
 
 async fn on_byte(
@@ -447,6 +692,48 @@ async fn write(console: &mut Console<'_>, data: &[u8]) -> Result<(), Disconnecte
 
 fn execute(links: &Links<'_>, line: &[u8]) -> Text {
     match split_command(line) {
+        (b"dry-run", rest) => dry_run(links, rest),
+        _ => live(links, line),
+    }
+}
+
+fn live(links: &Links<'_>, line: &[u8]) -> Text {
+    match scan::parse(line, &SCAN_LIMITS) {
+        Err(ScanError::NotAScan) => run_command(links, line),
+        Ok(plan) => start_scan(links, Job { plan, mode: Mode::Live }),
+        Err(error) => formatted(format_args!("scan: {error}")),
+    }
+}
+
+fn dry_run(links: &Links<'_>, line: &[u8]) -> Text {
+    match scan::parse(line, &SCAN_LIMITS) {
+        Err(ScanError::NotAScan) => dry_command(links, line),
+        Ok(plan) => start_scan(links, Job { plan, mode: Mode::Dry }),
+        Err(error) => formatted(format_args!("scan: {error}")),
+    }
+}
+
+fn dry_command(links: &Links<'_>, line: &[u8]) -> Text {
+    match split_command(line) {
+        (b"sd", command) => preview(links.spectradrive, command),
+        (b"ps", command) => preview(links.ps445, command),
+        _ => reply(b"usage: dry-run sd|ps <command> | dry-run <scan>"),
+    }
+}
+
+fn preview(link: &Link, command: &[u8]) -> Text {
+    match check(command, link.allowed) {
+        Ok(()) => formatted(format_args!(
+            "would send to {}: {}",
+            link.device.name(),
+            core::str::from_utf8(command).unwrap_or("<binary>"),
+        )),
+        Err(rejection) => rejected(link, &rejection),
+    }
+}
+
+fn run_command(links: &Links<'_>, line: &[u8]) -> Text {
+    match split_command(line) {
         (b"", _) => Text::new(),
         (b"nop", _) => reply(b"ok"),
         (b"status", _) => status(links),
@@ -454,13 +741,15 @@ fn execute(links: &Links<'_>, line: &[u8]) -> Text {
             Some(link) => allowed_words(link),
             None => reply(b"usage: allowed sd|ps"),
         },
+        (b"abort", b"scan") => abort_scan(links),
         (b"abort", target) => match links.find(target) {
             Some(link) => {
                 link.abort.signal(());
                 reply(b"abort requested")
             }
-            None => reply(b"usage: abort sd|ps"),
+            None => reply(b"usage: abort sd|ps|scan"),
         },
+        (b"sd" | b"ps", _) if links.scan.active.get() => reply(b"scan running, use abort scan"),
         (b"sd", command) => enqueue(links.spectradrive, command),
         (b"ps", command) => enqueue(links.ps445, command),
         _ => reply(b"unknown command"),
@@ -479,12 +768,58 @@ fn enqueue(link: &Link, command: &[u8]) -> Text {
     }
 }
 
+fn start_scan(links: &Links<'_>, job: Job) -> Text {
+    if links.scan.active.get() {
+        return reply(b"scan already running");
+    }
+    if job.mode == Mode::Live && !links.all().iter().all(|link| link.is_idle()) {
+        return reply(b"devices busy, wait or abort first");
+    }
+    let started = match job.mode {
+        Mode::Live => &b"scan started"[..],
+        Mode::Dry => &b"dry run started"[..],
+    };
+    match links.scan.requests.try_send(job) {
+        Ok(()) => {
+            links.scan.active.set(true);
+            reply(started)
+        }
+        Err(_) => reply(b"scan already queued"),
+    }
+}
+
+fn abort_scan(links: &Links<'_>) -> Text {
+    if !links.scan.active.get() {
+        return reply(b"no scan running");
+    }
+    links.scan.abort.set(true);
+    for link in links.all() {
+        link.abort.signal(());
+    }
+    reply(b"abort requested")
+}
+
+fn formatted(args: fmt::Arguments<'_>) -> Text {
+    let mut text: String<512> = String::new();
+    match text.write_fmt(args) {
+        Ok(()) => reply(text.as_bytes()),
+        Err(_) => reply(b"reply too long"),
+    }
+}
+
 fn status(links: &Links<'_>) -> Text {
     let mut text: String<512> = String::new();
     for link in links.all() {
         if describe(link, &mut text).is_err() {
             return reply(b"status overflow");
         }
+    }
+    let scan_state = match links.scan.active.get() {
+        true => "running",
+        false => "idle",
+    };
+    if write!(text, "scan {scan_state}\r\n").is_err() {
+        return reply(b"status overflow");
     }
     reply(text.trim_end().as_bytes())
 }

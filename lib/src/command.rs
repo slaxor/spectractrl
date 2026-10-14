@@ -26,18 +26,21 @@ impl Word {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rejection<'a> {
     UnknownWord(&'a [u8]),
+    MalformedNumber(&'a [u8]),
     WrongArguments { word: &'a [u8], expected: &'static [Arg] },
     TooManyArguments,
     DanglingArguments,
 }
 
 /// Checks that every word in `command` is listed in `words` and is preceded by
-/// exactly the numbers it expects. Numbers no word consumes are refused.
+/// exactly the numbers it expects. Numbers no word consumes are refused, and so
+/// are decimals with anything but exactly one fraction digit.
 pub fn check<'a>(command: &'a [u8], words: &[Word]) -> Result<(), Rejection<'a>> {
     let mut pending = Pending::new();
     for token in tokens(command) {
         match number_kind(token) {
             Some(arg) => pending.push(arg)?,
+            None if looks_numeric(token) => return Err(Rejection::MalformedNumber(token)),
             None => consume(token, words, &mut pending)?,
         }
     }
@@ -52,9 +55,18 @@ fn number_kind(token: &[u8]) -> Option<Arg> {
     let unsigned = token.strip_prefix(b"-").unwrap_or(token);
     match unsigned.iter().position(|&byte| byte == b'.') {
         None => all_digits(unsigned).then_some(Arg::Integer),
-        Some(dot) => (all_digits(&unsigned[..dot]) && all_digits(&unsigned[dot + 1..]))
+        Some(dot) => (all_digits(&unsigned[..dot]) && is_single_digit(&unsigned[dot + 1..]))
             .then_some(Arg::Decimal),
     }
+}
+
+fn looks_numeric(token: &[u8]) -> bool {
+    let unsigned = token.strip_prefix(b"-").unwrap_or(token);
+    unsigned.first().is_some_and(u8::is_ascii_digit)
+}
+
+fn is_single_digit(text: &[u8]) -> bool {
+    matches!(text, [digit] if digit.is_ascii_digit())
 }
 
 fn all_digits(text: &[u8]) -> bool {
@@ -142,6 +154,9 @@ impl fmt::Display for Rejection<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Rejection::UnknownWord(word) => write!(f, "unknown word {}", Ascii(word)),
+            Rejection::MalformedNumber(number) => {
+                write!(f, "malformed number {}, decimals take exactly one digit after the point", Ascii(number))
+            }
             Rejection::WrongArguments { word, expected } => {
                 let usage = Word { name: b"", args: expected };
                 write!(f, "usage: {usage}{}", Ascii(word))
@@ -183,7 +198,10 @@ mod tests {
             ("dangling number", b"300.0", Err(Rejection::DanglingArguments)),
             ("dangling after word", b"?NM 5", Err(Rejection::DanglingArguments)),
             ("unknown word", b"FOO", Err(Rejection::UnknownWord(&b"FOO"[..]))),
-            ("trailing dot is not a decimal", b"300. NM", Err(Rejection::UnknownWord(&b"300."[..]))),
+            ("trailing dot", b"300. NM", Err(Rejection::MalformedNumber(&b"300."[..]))),
+            ("two decimals", b"300.55 NM", Err(Rejection::MalformedNumber(&b"300.55"[..]))),
+            ("padded decimals", b"300.500 GOTO NM", Err(Rejection::MalformedNumber(&b"300.500"[..]))),
+            ("digits then letters", b"3x0 NM", Err(Rejection::MalformedNumber(&b"3x0"[..]))),
             ("leading dot is not a decimal", b".5 NM", Err(Rejection::UnknownWord(&b".5"[..]))),
             ("too many numbers", b"1 2 3 4 5 VOLTS", Err(Rejection::TooManyArguments)),
         ];
