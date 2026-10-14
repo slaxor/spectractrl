@@ -28,3 +28,4 @@ embassy-futures = "0.1.2"
 heapless = "0.9.3"
 embassy-usb = { version = "0.6.0", features = ["defmt"] }
 embedded-io-async = "0.7"
+embassy-sync = "0.8"
