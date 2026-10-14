@@ -10,14 +10,15 @@ use embassy_executor::Spawner;
 use embassy_futures::join::{join, join5};
 use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{self, Level, Output, Pull};
+use embassy_rp::gpio::{self, Pull};
 use embassy_rp::peripherals::{UART0, UART1, USB};
+use embassy_rp::pwm::{self, Pwm};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::usb::{self, Driver};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::Builder;
@@ -25,9 +26,10 @@ use embedded_io_async::{Read, Write};
 use heapless::{String, Vec};
 use {defmt_rtt as _, panic_probe as _};
 
+use spectractrl::colour::wavelength_rgb;
 use spectractrl::command::{check, Arg, Rejection, Word};
 use spectractrl::history::History;
-use spectractrl::scan::{self, parse_reading, Limits, Nm, NmRange, Plan, ScanError};
+use spectractrl::scan::{self, parse_reading, target_wavelength, Limits, Nm, NmRange, Picometers, Plan, ScanError};
 use spectractrl::xxd::{self, is_printable, XxdRow};
 
 bind_interrupts!(struct Irqs {
@@ -43,6 +45,8 @@ const DONE_MARKER: &[u8] = b"ok";
 const FAILED_MARKER: &[u8] = b"?";
 const SETTLE: Duration = Duration::from_millis(500);
 const DEBOUNCE: Duration = Duration::from_millis(20);
+const BLINK: Duration = Duration::from_millis(500);
+const LAMP_BRIGHTNESS: u16 = 64;
 const PACKET: usize = 64;
 const PROMPT: &[u8] = b"> ";
 const REPEAT: &[u8] = b".";
@@ -172,6 +176,7 @@ struct Link {
     finished: Signal<NoopRawMutex, Outcome>,
     current: RefCell<Option<Line>>,
     last_output: RefCell<Text>,
+    wavelength: Cell<Option<Picometers>>,
     sent: Cell<u32>,
     lines: Cell<u32>,
     errors: Cell<u32>,
@@ -187,6 +192,7 @@ impl Link {
             finished: Signal::new(),
             current: RefCell::new(None),
             last_output: RefCell::new(Text::new()),
+            wavelength: Cell::new(None),
             sent: Cell::new(0),
             lines: Cell::new(0),
             errors: Cell::new(0),
@@ -324,7 +330,8 @@ async fn main(_spawner: Spawner) {
     let scan = Scan::new();
     let events = Events::new();
     let unlock_jumper = gpio::Input::new(p.PIN_2, Pull::Up);
-    let unlock_led = Output::new(p.PIN_18, Level::High);
+    let red_green = Pwm::new_output_ab(p.PWM_SLICE1, p.PIN_18, p.PIN_19, lamp_config(0, 0));
+    let blue = Pwm::new_output_a(p.PWM_SLICE2, p.PIN_20, lamp_config(0, 0));
     let unlocked = Cell::new(false);
     let links = Links { spectradrive: &sd, ps445: &ps, scan: &scan, unlocked: &unlocked };
 
@@ -352,22 +359,52 @@ async fn main(_spawner: Spawner) {
             worker(&ps, ps445, &events),
             scanner(&links, &events),
         ),
-        guard(unlock_jumper, unlock_led, &unlocked),
+        join(guard(unlock_jumper, &unlocked), lamp(red_green, blue, &unlocked, &sd)),
     )
     .await;
 }
 
-async fn guard(mut jumper: gpio::Input<'_>, mut led: Output<'_>, unlocked: &Cell<bool>) -> ! {
+async fn guard(mut jumper: gpio::Input<'_>, unlocked: &Cell<bool>) -> ! {
     loop {
         let closed = jumper.is_low();
         if closed != unlocked.get() {
             warn!("whitelist {}", if closed { "bypassed by unlock jumper" } else { "active" });
         }
         unlocked.set(closed);
-        led.set_level(if closed { Level::Low } else { Level::High });
         jumper.wait_for_any_edge().await;
         Timer::after(DEBOUNCE).await;
     }
+}
+
+async fn lamp(mut red_green: Pwm<'_>, mut blue: Pwm<'_>, unlocked: &Cell<bool>, spectradrive: &Link) -> ! {
+    let mut ticker = Ticker::every(BLINK);
+    let mut blink_on = false;
+    loop {
+        blink_on = !blink_on;
+        let [red, green, blue_level] = lamp_colour(unlocked.get(), blink_on, spectradrive.wavelength.get());
+        red_green.set_config(&lamp_config(red, green));
+        blue.set_config(&lamp_config(blue_level, 0));
+        ticker.next().await;
+    }
+}
+
+fn lamp_colour(unlocked: bool, blink_on: bool, wavelength: Option<Picometers>) -> [u8; 3] {
+    match (unlocked, wavelength) {
+        (true, _) if blink_on => [u8::MAX, 0, 0],
+        (true, _) => [0, 0, 0],
+        (false, Some(wavelength)) => wavelength_rgb(wavelength),
+        (false, None) => [0, 0, 0],
+    }
+}
+
+fn lamp_config(a: u8, b: u8) -> pwm::Config {
+    let mut config = pwm::Config::default();
+    config.top = u16::from(u8::MAX);
+    config.compare_a = u16::from(a) * LAMP_BRIGHTNESS / u16::from(u8::MAX);
+    config.compare_b = u16::from(b) * LAMP_BRIGHTNESS / u16::from(u8::MAX);
+    config.invert_a = true;
+    config.invert_b = true;
+    config
 }
 
 fn uart_config(baudrate: u32) -> uart::Config {
@@ -467,9 +504,18 @@ fn finish(link: &Link, events: &Events, kind: Kind) {
 }
 
 fn conclude(link: &Link, kind: Kind) {
-    *link.current.borrow_mut() = None;
+    let command = link.current.take();
+    if kind == Kind::Done {
+        track_wavelength(link, command.as_deref());
+    }
     let output = link.last_output.take();
     link.finished.signal(Outcome { kind, output });
+}
+
+fn track_wavelength(link: &Link, command: Option<&[u8]>) {
+    if let Some(wavelength) = command.and_then(target_wavelength) {
+        link.wavelength.set(Some(wavelength));
+    }
 }
 
 fn remember(link: &Link, text: &[u8]) {
@@ -970,6 +1016,14 @@ fn status(links: &Links<'_>) -> Text {
         false => "idle",
     };
     if write!(text, "scan {scan_state}\r\n").is_err() {
+        return reply(b"status overflow");
+    }
+    let wavelength = links.spectradrive.wavelength.get();
+    let written = match wavelength {
+        Some(wavelength) => write!(text, "wavelength {} nm (last move)\r\n", Nm(wavelength)),
+        None => write!(text, "wavelength unknown\r\n"),
+    };
+    if written.is_err() {
         return reply(b"status overflow");
     }
     let whitelist_state = match links.unlocked.get() {

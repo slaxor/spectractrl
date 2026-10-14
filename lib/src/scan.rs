@@ -12,6 +12,7 @@ pub const MAX_READS: i32 = 100;
 const FRACTION_DIGITS: usize = 1;
 const PICOMETERS_PER_FRACTION_UNIT: Picometers = 100;
 const MAX_ARGS: usize = 6;
+const MOVE_WORDS: [&[u8]; 2] = [b"GOTO", b"NM"];
 
 /// Inclusive wavelength range a grating can reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +152,20 @@ pub fn parse_picometers(token: &[u8]) -> Option<Picometers> {
     let whole: i32 = core::str::from_utf8(whole).ok()?.parse().ok()?;
     let tenths = fraction.first().map_or(0, |digit| i32::from(digit - b'0'));
     whole.checked_mul(1000)?.checked_add(tenths * PICOMETERS_PER_FRACTION_UNIT)
+}
+
+/// The wavelength a SpectraDrive command moves to: the number in front of the
+/// last GOTO or NM, if there is one.
+pub fn target_wavelength(command: &[u8]) -> Option<Picometers> {
+    let mut previous: Option<&[u8]> = None;
+    let mut target = None;
+    for token in tokens(command) {
+        if MOVE_WORDS.iter().any(|word| token.eq_ignore_ascii_case(word)) {
+            target = previous.and_then(parse_picometers).or(target);
+        }
+        previous = Some(token);
+    }
+    target
 }
 
 /// Returns the last whitespace-separated token of `output` as an integer.
@@ -404,6 +419,22 @@ mod tests {
             self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(text.as_bytes());
             self.len = end;
             Ok(())
+        }
+    }
+
+    #[test]
+    fn target_wavelength_cases() {
+        let cases: &[(&str, &[u8], Option<Picometers>)] = &[
+            ("goto", b"300.5 GOTO", Some(300_500)),
+            ("nm lower case", b"666.0 nm", Some(666_000)),
+            ("query", b"?NM", None),
+            ("grating", b"1 GRATING", None),
+            ("last move wins", b"300.0 GOTO 400.0 NM", Some(400_000)),
+            ("word without number", b"GOTO", None),
+            ("empty", b"", None),
+        ];
+        for (name, command, expected) in cases {
+            assert_eq!(&target_wavelength(command), expected, "{name}");
         }
     }
 
