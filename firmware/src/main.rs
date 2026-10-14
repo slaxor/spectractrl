@@ -26,6 +26,7 @@ use heapless::{String, Vec};
 use {defmt_rtt as _, panic_probe as _};
 
 use spectractrl::command::{check, Arg, Rejection, Word};
+use spectractrl::history::History;
 use spectractrl::scan::{self, parse_reading, Limits, Nm, NmRange, Plan, ScanError};
 use spectractrl::xxd::{self, is_printable, XxdRow};
 
@@ -44,10 +45,15 @@ const SETTLE: Duration = Duration::from_millis(500);
 const DEBOUNCE: Duration = Duration::from_millis(20);
 const PACKET: usize = 64;
 const PROMPT: &[u8] = b"> ";
+const REPEAT: &[u8] = b".";
+const LINE_CAPACITY: usize = 128;
+const HISTORY_ENTRIES: usize = 16;
 const DRY_READING: &[u8] = b"0";
 const HELP: &str = concat!(
     "console\r\n",
     "  help                  this text\r\n",
+    "  up / down             walk through the last 16 commands\r\n",
+    "  .                     repeat the last command\r\n",
     "  nop                   answers ok\r\n",
     "  status                per device busy/idle, queue, counters; scan state\r\n",
     "  allowed sd|ps         whitelisted words with their arguments\r\n",
@@ -105,7 +111,8 @@ const GRATINGS: &[NmRange] = &[
 const SCAN_LIMITS: Limits<'static> = Limits { gratings: GRATINGS, volts: 0..=1000 };
 
 type Console<'d> = CdcAcmClass<'d, Driver<'d, USB>>;
-type Line = Vec<u8, 128>;
+type Line = Vec<u8, LINE_CAPACITY>;
+type CommandHistory = History<HISTORY_ENTRIES, LINE_CAPACITY>;
 type Text = Vec<u8, 512>;
 type Requests = Channel<NoopRawMutex, Line, 4>;
 type Events = Channel<NoopRawMutex, Event, 8>;
@@ -271,6 +278,19 @@ enum Input {
     Byte(u8),
     Error(uart::Error),
     Settled,
+}
+
+#[derive(Clone, Copy)]
+enum Escape {
+    Idle,
+    Started,
+    Bracket,
+}
+
+struct Editor {
+    line: Line,
+    escape: Escape,
+    history: CommandHistory,
 }
 
 struct Disconnected;
@@ -619,21 +639,28 @@ async fn report(events: &Events, mode: Mode, result: Result<u32, ScanFailure>) {
 }
 
 async fn serve(console: &mut Console<'_>, links: &Links<'_>, events: &Events) -> ! {
+    let mut editor = Editor { line: Line::new(), escape: Escape::Idle, history: CommandHistory::new() };
     loop {
         console.wait_connection().await;
         info!("console connected");
-        let Disconnected = session(console, links, events).await;
+        let Disconnected = session(console, links, events, &mut editor).await;
         info!("console disconnected");
     }
 }
 
-async fn session(console: &mut Console<'_>, links: &Links<'_>, events: &Events) -> Disconnected {
-    let mut line = Line::new();
+async fn session(
+    console: &mut Console<'_>,
+    links: &Links<'_>,
+    events: &Events,
+    editor: &mut Editor,
+) -> Disconnected {
+    editor.line.clear();
+    editor.escape = Escape::Idle;
     if let Err(disconnected) = write(console, PROMPT).await {
         return disconnected;
     }
     loop {
-        if let Err(disconnected) = step(console, links, events, &mut line).await {
+        if let Err(disconnected) = step(console, links, events, editor).await {
             return disconnected;
         }
     }
@@ -643,7 +670,7 @@ async fn step(
     console: &mut Console<'_>,
     links: &Links<'_>,
     events: &Events,
-    line: &mut Line,
+    editor: &mut Editor,
 ) -> Result<(), Disconnected> {
     let mut packet = [0u8; PACKET];
     let input = select(console.read_packet(&mut packet), events.receive()).await;
@@ -651,12 +678,12 @@ async fn step(
         Either::First(received) => {
             let len = received?;
             for &byte in &packet[..len] {
-                on_byte(console, links, line, byte).await?;
+                on_byte(console, links, editor, byte).await?;
             }
             Ok(())
         }
         Either::Second(event) if is_noise(links, &event) => Ok(()),
-        Either::Second(event) => announce(console, &event, line).await,
+        Either::Second(event) => announce(console, &event, &editor.line).await,
     }
 }
 
@@ -697,18 +724,72 @@ async fn dump(console: &mut Console<'_>, bytes: &[u8]) -> Result<(), Disconnecte
 async fn on_byte(
     console: &mut Console<'_>,
     links: &Links<'_>,
-    line: &mut Line,
+    editor: &mut Editor,
     byte: u8,
 ) -> Result<(), Disconnected> {
-    match byte {
-        b'\r' | b'\n' => submit(console, links, line).await,
-        0x08 | 0x7f => erase(console, line).await,
-        _ => append(console, line, byte).await,
+    match (editor.escape, byte) {
+        (Escape::Idle, 0x1b) => {
+            editor.escape = Escape::Started;
+            Ok(())
+        }
+        (Escape::Started, b'[') => {
+            editor.escape = Escape::Bracket;
+            Ok(())
+        }
+        (Escape::Started, _) => {
+            editor.escape = Escape::Idle;
+            Ok(())
+        }
+        (Escape::Bracket, b'A') => {
+            editor.escape = Escape::Idle;
+            show_recalled(console, &mut editor.line, editor.history.older()).await
+        }
+        (Escape::Bracket, b'B') => {
+            editor.escape = Escape::Idle;
+            show_recalled(console, &mut editor.line, editor.history.newer()).await
+        }
+        (Escape::Bracket, 0x40..=0x7e) => {
+            editor.escape = Escape::Idle;
+            Ok(())
+        }
+        (Escape::Bracket, _) => Ok(()),
+        (Escape::Idle, b'\r' | b'\n') => submit(console, links, editor).await,
+        (Escape::Idle, 0x08 | 0x7f) => erase(console, &mut editor.line).await,
+        (Escape::Idle, _) => append(console, &mut editor.line, byte).await,
     }
 }
 
-async fn submit(console: &mut Console<'_>, links: &Links<'_>, line: &mut Line) -> Result<(), Disconnected> {
+async fn show_recalled(
+    console: &mut Console<'_>,
+    line: &mut Line,
+    recalled: Option<&[u8]>,
+) -> Result<(), Disconnected> {
+    let Some(entry) = recalled else {
+        return write(console, b"\x07").await;
+    };
+    *line = Line::from_slice(entry).expect("history entries fit a line");
+    write(console, b"\r\x1b[K").await?;
+    write(console, PROMPT).await?;
+    write(console, line).await
+}
+
+async fn expand_repeat(console: &mut Console<'_>, editor: &mut Editor) -> Result<(), Disconnected> {
+    if editor.line.as_slice() != REPEAT {
+        return Ok(());
+    }
+    let Some(last) = editor.history.last() else {
+        return Ok(());
+    };
+    editor.line = Line::from_slice(last).expect("history entries fit a line");
+    write(console, &editor.line).await?;
+    write(console, b"\r\n").await
+}
+
+async fn submit(console: &mut Console<'_>, links: &Links<'_>, editor: &mut Editor) -> Result<(), Disconnected> {
     write(console, b"\r\n").await?;
+    expand_repeat(console, editor).await?;
+    editor.history.push(&editor.line);
+    let line = &mut editor.line;
     if line.as_slice() == b"help" {
         line.clear();
         write(console, HELP.as_bytes()).await?;
