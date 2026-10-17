@@ -8,7 +8,7 @@ use core::future::pending;
 use defmt::{info, warn, Debug2Format};
 use embassy_executor::Spawner;
 use embassy_futures::join::{join, join5};
-use embassy_futures::select::{select, select4, Either, Either4};
+use embassy_futures::select::{select, select3, select4, Either, Either3, Either4};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{self, Pull};
 use embassy_rp::peripherals::{UART0, UART1, USB};
@@ -17,6 +17,7 @@ use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::usb::{self, Driver};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::pipe::Pipe;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
@@ -47,6 +48,8 @@ const FAILED_MARKER: &[u8] = b"?";
 const SETTLE: Duration = Duration::from_millis(500);
 const DEBOUNCE: Duration = Duration::from_millis(20);
 const BLINK: Duration = Duration::from_millis(500);
+const RELAY_POLL: Duration = Duration::from_millis(100);
+const RELAY_EXIT: u8 = 0x1d;
 const LAMP_BRIGHTNESS: u16 = 64;
 const PACKET: usize = 64;
 const PROMPT: &[u8] = b"> ";
@@ -60,12 +63,13 @@ const HELP: &str = concat!(
     "  up / down             walk through the last 16 commands\r\n",
     "  .                     repeat the last command\r\n",
     "  nop                   answers ok\r\n",
-    "  status                per device busy/idle, queue, counters; scan state\r\n",
+    "  status                local state, then asks idle devices for theirs\r\n",
     "  allowed sd|ps         whitelisted words with their arguments\r\n",
     "  sd <forth>            queue a command for the SpectraDrive\r\n",
     "  ps <forth>            queue a command for the PS-445\r\n",
     "                        with the unlock jumper closed, sd/ps skip the whitelist\r\n",
     "  abort sd|ps|scan      stop waiting for a device, or stop the running macro\r\n",
+    "  goto sd|ps            transparent link to a device, unlock jumper only; Ctrl-] leaves\r\n",
     "  dry-run <command>     show what an sd, ps or macro command would send, send nothing\r\n",
     "\r\n",
     "macros\r\n",
@@ -106,6 +110,8 @@ const PS445_WORDS: &[Word] = &[
 ];
 
 const PMT_VOLTAGE_WORD: &str = "VOLTS";
+const SPECTRADRIVE_STATUS_QUERIES: &[&[u8]] = &[b"?NM", b"?GRATING", b"STATE"];
+const PS445_STATUS_QUERIES: &[&[u8]] = &[];
 const PMT_ON_WORD: &str = "PMT-ON";
 const PMT_OFF_WORD: &str = "PMT-OFF";
 
@@ -122,6 +128,7 @@ type CommandHistory = History<HISTORY_ENTRIES, LINE_CAPACITY>;
 type Text = Vec<u8, 512>;
 type Requests = Channel<NoopRawMutex, Line, 4>;
 type Events = Channel<NoopRawMutex, Event, 8>;
+type RawPipe = Pipe<NoopRawMutex, 256>;
 
 #[derive(Clone, Copy, defmt::Format)]
 enum Device {
@@ -182,6 +189,9 @@ struct Link {
     sent: Cell<u32>,
     lines: Cell<u32>,
     errors: Cell<u32>,
+    passthrough: Cell<bool>,
+    to_device: RawPipe,
+    from_device: RawPipe,
 }
 
 impl Link {
@@ -198,6 +208,9 @@ impl Link {
             sent: Cell::new(0),
             lines: Cell::new(0),
             errors: Cell::new(0),
+            passthrough: Cell::new(false),
+            to_device: RawPipe::new(),
+            from_device: RawPipe::new(),
         }
     }
 
@@ -277,6 +290,10 @@ impl Links<'_> {
 
     fn all(&self) -> [&Link; 2] {
         [self.spectradrive, self.ps445]
+    }
+
+    fn relaying(&self) -> Option<&Link> {
+        self.all().into_iter().find(|link| link.passthrough.get())
     }
 }
 
@@ -361,18 +378,21 @@ async fn main(_spawner: Spawner) {
             worker(&ps, ps445, &events),
             scanner(&links, &events),
         ),
-        join(guard(unlock_jumper, &unlocked), lamp(red_green, blue, &unlocked, &sd)),
+        join(guard(unlock_jumper, &links), lamp(red_green, blue, &unlocked, &sd)),
     )
     .await;
 }
 
-async fn guard(mut jumper: gpio::Input<'_>, unlocked: &Cell<bool>) -> ! {
+async fn guard(mut jumper: gpio::Input<'_>, links: &Links<'_>) -> ! {
     loop {
         let closed = jumper.is_low();
-        if closed != unlocked.get() {
+        if closed != links.unlocked.get() {
             warn!("whitelist {}", if closed { "bypassed by unlock jumper" } else { "active" });
         }
-        unlocked.set(closed);
+        links.unlocked.set(closed);
+        if !closed {
+            end_relays(links);
+        }
         jumper.wait_for_any_edge().await;
         Timer::after(DEBOUNCE).await;
     }
@@ -430,6 +450,12 @@ async fn worker(link: &Link, mut port: BufferedUart, events: &Events) -> ! {
     let mut line = Text::new();
     let mut settling = false;
     loop {
+        if link.passthrough.get() {
+            relay_device(link, &mut port).await;
+            line.clear();
+            settling = false;
+            continue;
+        }
         match next_input(link, &mut port, settling).await {
             Input::Request(command) => start(link, &mut port, command, events).await,
             Input::Abort => finish(link, events, Kind::Aborted),
@@ -443,6 +469,48 @@ async fn worker(link: &Link, mut port: BufferedUart, events: &Events) -> ! {
                 bump(&link.errors);
             }
         }
+    }
+}
+
+async fn relay_device(link: &Link, port: &mut BufferedUart) {
+    info!("{} relay on", link.device);
+    let mut inbound = [0u8; 64];
+    let mut outbound = [0u8; 64];
+    while link.passthrough.get() {
+        let input = select3(port.read(&mut inbound), link.to_device.read(&mut outbound), link.abort.wait()).await;
+        match input {
+            Either3::First(Ok(len)) => forward_to_console(link, &inbound[..len]),
+            Either3::First(Err(error)) => {
+                warn!("{} relay rx: {}", link.device, Debug2Format(&error));
+                bump(&link.errors);
+            }
+            Either3::Second(len) => {
+                if let Err(error) = port.write_all(&outbound[..len]).await {
+                    warn!("{} relay tx: {}", link.device, Debug2Format(&error));
+                    bump(&link.errors);
+                }
+            }
+            Either3::Third(()) => {}
+        }
+    }
+    info!("{} relay off", link.device);
+}
+
+fn forward_to_console(link: &Link, bytes: &[u8]) {
+    match link.from_device.try_write(bytes) {
+        Ok(written) if written == bytes.len() => {}
+        _ => warn!("{} relay output dropped, console not reading", link.device),
+    }
+}
+
+fn end_relay(link: &Link) {
+    link.passthrough.set(false);
+    link.abort.signal(());
+}
+
+fn end_relays(links: &Links<'_>) {
+    if let Some(link) = links.relaying() {
+        end_relay(link);
     }
 }
 
@@ -695,6 +763,7 @@ async fn serve(console: &mut Console<'_>, links: &Links<'_>, events: &Events) ->
         console.wait_connection().await;
         info!("console connected");
         let Disconnected = session(console, links, events, &mut editor).await;
+        end_relays(links);
         info!("console disconnected");
     }
 }
@@ -723,6 +792,9 @@ async fn step(
     events: &Events,
     editor: &mut Editor,
 ) -> Result<(), Disconnected> {
+    if let Some(link) = links.relaying() {
+        return relay_console(console, link).await;
+    }
     let mut packet = [0u8; PACKET];
     let input = select(console.read_packet(&mut packet), events.receive()).await;
     match input {
@@ -735,6 +807,53 @@ async fn step(
         }
         Either::Second(event) if is_noise(links, &event) => Ok(()),
         Either::Second(event) => announce(console, &event, &editor.line).await,
+    }
+}
+
+async fn relay_console(console: &mut Console<'_>, link: &Link) -> Result<(), Disconnected> {
+    while link.passthrough.get() {
+        relay_step(console, link).await?;
+    }
+    write(console, b"\r\n[").await?;
+    write(console, link.device.name().as_bytes()).await?;
+    write(console, b":relay] ended\r\n").await?;
+    write(console, PROMPT).await
+}
+
+async fn relay_step(console: &mut Console<'_>, link: &Link) -> Result<(), Disconnected> {
+    let mut packet = [0u8; PACKET];
+    let mut inbound = [0u8; PACKET];
+    let input = select3(
+        console.read_packet(&mut packet),
+        link.from_device.read(&mut inbound),
+        Timer::after(RELAY_POLL),
+    )
+    .await;
+    match input {
+        Either3::First(received) => {
+            let len = received?;
+            relay_typed(link, &packet[..len]).await;
+            Ok(())
+        }
+        Either3::Second(len) => write(console, &inbound[..len]).await,
+        Either3::Third(()) => Ok(()),
+    }
+}
+
+async fn relay_typed(link: &Link, typed: &[u8]) {
+    match typed.iter().position(|&byte| byte == RELAY_EXIT) {
+        Some(at) => {
+            write_pipe(&link.to_device, &typed[..at]).await;
+            end_relay(link);
+        }
+        None => write_pipe(&link.to_device, typed).await,
+    }
+}
+
+async fn write_pipe(pipe: &RawPipe, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let written = pipe.write(bytes).await;
+        bytes = &bytes[written..];
     }
 }
 
@@ -946,11 +1065,32 @@ fn run_command(links: &Links<'_>, line: &[u8]) -> Text {
             }
             None => reply(b"usage: abort sd|ps|scan"),
         },
+        (b"goto", target) => start_relay(links, target),
         (b"sd" | b"ps", _) if links.scan.active.get() => reply(b"scan running, use abort scan"),
         (b"sd", command) => enqueue(links.spectradrive, command, links.unlocked.get()),
         (b"ps", command) => enqueue(links.ps445, command, links.unlocked.get()),
         _ => reply(b"unknown command"),
     }
+}
+
+fn start_relay(links: &Links<'_>, target: &[u8]) -> Text {
+    let Some(link) = links.find(target) else {
+        return reply(b"usage: goto sd|ps");
+    };
+    if !links.unlocked.get() {
+        return reply(b"goto needs the unlock jumper closed");
+    }
+    if links.scan.active.get() {
+        return reply(b"scan running, use abort scan");
+    }
+    link.to_device.clear();
+    link.from_device.clear();
+    link.passthrough.set(true);
+    link.abort.signal(());
+    formatted(format_args!(
+        "[{}:relay] transparent, Ctrl-] or opening the unlock jumper leaves",
+        link.device.name(),
+    ))
 }
 
 fn fits_device_line(command: &[u8]) -> bool {
@@ -1057,7 +1197,36 @@ fn status(links: &Links<'_>) -> Text {
     if write!(text, "whitelist {whitelist_state}\r\n").is_err() {
         return reply(b"status overflow");
     }
+    let remotes = [
+        (links.spectradrive, SPECTRADRIVE_STATUS_QUERIES),
+        (links.ps445, PS445_STATUS_QUERIES),
+    ];
+    for (link, queries) in remotes {
+        let outcome = query_remote(links, link, queries);
+        if write!(text, "remote {}: {outcome}\r\n", link.device.name()).is_err() {
+            return reply(b"status overflow");
+        }
+    }
     reply(text.trim_end().as_bytes())
+}
+
+fn query_remote(links: &Links<'_>, link: &Link, queries: &[&[u8]]) -> &'static str {
+    if links.scan.active.get() {
+        return "scan running, not queried";
+    }
+    if !link.is_idle() {
+        return "busy, not queried";
+    }
+    for query in queries {
+        if check(query, link.allowed).is_err() {
+            return "status query not whitelisted, stopped";
+        }
+        let line = Line::from_slice(query).expect("status queries fit a line");
+        if link.requests.try_send(line).is_err() {
+            return "queue full, partly queried";
+        }
+    }
+    "queried, answers follow"
 }
 
 fn describe(link: &Link, text: &mut String<512>) -> core::fmt::Result {
