@@ -6,9 +6,11 @@ pub type Picometers = i32;
 
 pub const RANGE_SCAN: &[u8] = b"RANGE-SCAN";
 pub const POINT_MEASURE: &[u8] = b"POINT-MEASURE";
+pub const SCAN: &[u8] = b"SCAN";
 pub const MIN_STEP: Picometers = 100;
 pub const MAX_STEP: Picometers = 100_000;
 pub const MAX_READS: i32 = 100;
+pub const MAX_INTEGRATION_MS: i32 = 60_000;
 const FRACTION_DIGITS: usize = 1;
 const PICOMETERS_PER_FRACTION_UNIT: Picometers = 100;
 const MAX_ARGS: usize = 6;
@@ -38,6 +40,7 @@ pub struct Limits<'a> {
 pub enum Macro {
     RangeScan,
     PointMeasure,
+    Scan,
 }
 
 impl Macro {
@@ -45,6 +48,7 @@ impl Macro {
         match word {
             _ if word.eq_ignore_ascii_case(RANGE_SCAN) => Some(Macro::RangeScan),
             _ if word.eq_ignore_ascii_case(POINT_MEASURE) => Some(Macro::PointMeasure),
+            _ if word.eq_ignore_ascii_case(SCAN) => Some(Macro::Scan),
             _ => None,
         }
     }
@@ -53,6 +57,7 @@ impl Macro {
         match self {
             Macro::RangeScan => 6,
             Macro::PointMeasure => 3,
+            Macro::Scan => 6,
         }
     }
 
@@ -62,8 +67,19 @@ impl Macro {
                 "usage: <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN"
             }
             Macro::PointMeasure => "usage: <grating> <nm> <reads> POINT-MEASURE",
+            Macro::Scan => {
+                "usage: <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <integration-ms> SCAN"
+            }
         }
     }
+}
+
+/// How each step gets its value: several plain reads, or one read after an
+/// integration of `ms` milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sampling {
+    Reads(i32),
+    Integrate { ms: i32 },
 }
 
 /// A validated measurement request; a point measurement has `start == end`.
@@ -75,7 +91,7 @@ pub struct Plan {
     pub end: Picometers,
     pub step: Picometers,
     pub volts: Option<i32>,
-    pub reads: i32,
+    pub sampling: Sampling,
 }
 
 impl Plan {
@@ -95,6 +111,7 @@ pub enum Field {
     Step,
     Volts,
     Reads,
+    IntegrationTime,
 }
 
 impl Field {
@@ -115,9 +132,10 @@ pub enum ScanError {
 /// Displays picometers as nm with one decimal, the only form the devices accept.
 pub struct Nm(pub Picometers);
 
-/// Parses `<grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN`
+/// Parses `<grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN`,
+/// `<grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <integration-ms> SCAN`
 /// or `<grating> <nm> <reads> POINT-MEASURE` and validates it against `limits`.
-/// Commands ending in neither word yield `ScanError::NotAScan`.
+/// Commands ending in none of these words yield `ScanError::NotAScan`.
 pub fn parse(command: &[u8], limits: &Limits<'_>) -> Result<Plan, ScanError> {
     let kind = tokens(command)
         .last()
@@ -133,6 +151,7 @@ pub fn parse(command: &[u8], limits: &Limits<'_>) -> Result<Plan, ScanError> {
     match kind {
         Macro::RangeScan => range_scan(args, limits),
         Macro::PointMeasure => point_measure(args, limits),
+        Macro::Scan => integrated_scan(args, limits),
     }
 }
 
@@ -179,7 +198,18 @@ fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 fn range_scan(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError> {
-    let [grating, start, end, step, volts, reads] = args;
+    let reads = within(integer(args[5], Field::Reads)?, Field::Reads, 1, MAX_READS)?;
+    sweep(args, limits, Sampling::Reads(reads))
+}
+
+fn integrated_scan(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError> {
+    let ms = integer(args[5], Field::IntegrationTime)?;
+    let ms = within(ms, Field::IntegrationTime, 1, MAX_INTEGRATION_MS)?;
+    sweep(args, limits, Sampling::Integrate { ms })
+}
+
+fn sweep(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>, sampling: Sampling) -> Result<Plan, ScanError> {
+    let [grating, start, end, step, volts, _] = args;
     let grating = integer(grating, Field::Grating)?;
     let range = grating_range(grating, limits)?;
     let start = within(wavelength(start, Field::Start)?, Field::Start, range.low, range.high)?;
@@ -191,8 +221,7 @@ fn range_scan(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, Scan
         *limits.volts.start(),
         *limits.volts.end(),
     )?;
-    let reads = within(integer(reads, Field::Reads)?, Field::Reads, 1, MAX_READS)?;
-    Ok(Plan { grating, start, end, step, volts: Some(volts), reads })
+    Ok(Plan { grating, start, end, step, volts: Some(volts), sampling })
 }
 
 fn point_measure(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError> {
@@ -201,7 +230,8 @@ fn point_measure(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, S
     let range = grating_range(grating, limits)?;
     let nm = within(wavelength(nm, Field::Wavelength)?, Field::Wavelength, range.low, range.high)?;
     let reads = within(integer(reads, Field::Reads)?, Field::Reads, 1, MAX_READS)?;
-    Ok(Plan { grating, start: nm, end: nm, step: MIN_STEP, volts: None, reads })
+    let sampling = Sampling::Reads(reads);
+    Ok(Plan { grating, start: nm, end: nm, step: MIN_STEP, volts: None, sampling })
 }
 
 fn integer(token: &[u8], field: Field) -> Result<i32, ScanError> {
@@ -244,6 +274,7 @@ impl fmt::Display for Field {
             Field::Step => "step-nm",
             Field::Volts => "pmt-volts",
             Field::Reads => "reads",
+            Field::IntegrationTime => "integration-ms",
         })
     }
 }
@@ -276,7 +307,10 @@ impl fmt::Display for Plan {
             Some(volts) => write!(f, ", {volts} V")?,
             None => f.write_str(", PMT voltage unchanged")?,
         }
-        write!(f, ", {} reads per step", self.reads)
+        match self.sampling {
+            Sampling::Reads(reads) => write!(f, ", {reads} reads per step"),
+            Sampling::Integrate { ms } => write!(f, ", {ms} ms integration per step"),
+        }
     }
 }
 
@@ -291,7 +325,7 @@ mod tests {
     };
 
     fn plan(start: i32, end: i32, step: i32) -> Plan {
-        Plan { grating: 1, start, end, step, volts: Some(500), reads: 3 }
+        Plan { grating: 1, start, end, step, volts: Some(500), sampling: Sampling::Reads(3) }
     }
 
     #[test]
@@ -301,6 +335,26 @@ mod tests {
             ("valid", b"1 300.0 400.0 0.5 500 3 RANGE-SCAN", Ok(plan(300_000, 400_000, 500))),
             ("integers as nm", b"1 300 400 1 500 3 range-scan", Ok(plan(300_000, 400_000, 1_000))),
             (
+                "integrated scan",
+                b"1 300.0 400.0 0.5 500 250 scan",
+                Ok(Plan { sampling: Sampling::Integrate { ms: 250 }, ..plan(300_000, 400_000, 500) }),
+            ),
+            (
+                "integration too long",
+                b"1 300.0 400.0 0.5 500 90000 SCAN",
+                Err(ScanError::OutOfRange { field: Field::IntegrationTime, low: 1, high: 60_000 }),
+            ),
+            (
+                "integration as decimal",
+                b"1 300.0 400.0 0.5 500 0.5 SCAN",
+                Err(ScanError::BadNumber(Field::IntegrationTime)),
+            ),
+            (
+                "scan missing argument",
+                b"1 300.0 400.0 0.5 SCAN",
+                Err(ScanError::Usage(Macro::Scan)),
+            ),
+            (
                 "missing argument",
                 b"1 300.0 400.0 0.5 500 RANGE-SCAN",
                 Err(ScanError::Usage(Macro::RangeScan)),
@@ -308,7 +362,14 @@ mod tests {
             (
                 "point measure",
                 b"2 300.5 5 point-measure",
-                Ok(Plan { grating: 2, start: 300_500, end: 300_500, step: 100, volts: None, reads: 5 }),
+                Ok(Plan {
+                    grating: 2,
+                    start: 300_500,
+                    end: 300_500,
+                    step: 100,
+                    volts: None,
+                    sampling: Sampling::Reads(5),
+                }),
             ),
             (
                 "point measure with volts",

@@ -30,7 +30,9 @@ use {defmt_rtt as _, panic_probe as _};
 use spectractrl::colour::wavelength_rgb;
 use spectractrl::command::{check, Arg, Rejection, Word};
 use spectractrl::history::History;
-use spectractrl::scan::{self, parse_reading, target_wavelength, Limits, Nm, NmRange, Picometers, Plan, ScanError};
+use spectractrl::scan::{
+    self, parse_reading, target_wavelength, Limits, Nm, NmRange, Picometers, Plan, Sampling, ScanError,
+};
 use spectractrl::xxd::{self, is_printable, XxdRow};
 
 bind_interrupts!(struct Irqs {
@@ -73,9 +75,13 @@ const HELP: &str = concat!(
     "  dry-run <command>     show what an sd, ps or macro command would send, send nothing\r\n",
     "\r\n",
     "macros\r\n",
+    "  <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <integration-ms> SCAN\r\n",
+    "      GRATING, VOLTS, CURRENT, PMT-ON, ITIME, INTEGRATE-START, then per step\r\n",
+    "      GOTO, wait two integration windows, .READ,\r\n",
+    "      one row \"nm,reading\" per step, PMT-OFF at the end, also on failure or abort\r\n",
     "  <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN\r\n",
-    "      GRATING, VOLTS, PMT-ON, then per step GOTO and <reads> x .READ,\r\n",
-    "      one row \"nm,reading,...\" per step, PMT-OFF at the end, also on failure or abort\r\n",
+    "      like SCAN, but <reads> x .READ per step instead of an integration,\r\n",
+    "      one row \"nm,reading,...\" per step\r\n",
     "  <grating> <nm> <reads> POINT-MEASURE\r\n",
     "      the same at a single wavelength, PMT voltage left unchanged\r\n",
     "\r\n",
@@ -100,6 +106,9 @@ const SPECTRADRIVE_WORDS: &[Word] = &[
 const PS445_WORDS: &[Word] = &[
     Word::new(b".READ", &[]),
     Word::new(b"?VOLTS", &[]),
+    Word::new(b"CURRENT", &[]),
+    Word::new(b"INTEGRATE-START", &[]),
+    Word::new(b"ITIME", &[Arg::Integer]),
     Word::new(b"PMT-OFF", &[]),
     Word::new(b"PMT-ON", &[]),
     Word::new(b"PMT-RANGE", &[]),
@@ -110,6 +119,11 @@ const PS445_WORDS: &[Word] = &[
 ];
 
 const PMT_VOLTAGE_WORD: &str = "VOLTS";
+const INTEGRATION_TIME_WORD: &str = "ITIME";
+const INTEGRATE_WORD: &str = "INTEGRATE-START";
+const CURRENT_MODE_WORD: &str = "CURRENT";
+const SETTLE_WINDOWS: u64 = 2;
+const READ_WORD: &str = ".READ";
 const SPECTRADRIVE_STATUS_QUERIES: &[&[u8]] = &[b"?NM", b"?GRATING", b"STATE"];
 const PS445_STATUS_QUERIES: &[&[u8]] = &[];
 const PMT_ON_WORD: &str = "PMT-ON";
@@ -662,14 +676,25 @@ async fn run_scan(job: &Job, links: &Links<'_>, events: &Events) -> Result<u32, 
     if let Some(volts) = plan.volts {
         call(mode, links.ps445, events, format_args!("{volts} {PMT_VOLTAGE_WORD}")).await?;
     }
+    if let Sampling::Integrate { .. } = plan.sampling {
+        call(mode, links.ps445, events, format_args!("{CURRENT_MODE_WORD}")).await?;
+    }
     let swept = match call(mode, links.ps445, events, format_args!("{PMT_ON_WORD}")).await {
-        Ok(_) => sweep(job, links, events).await,
+        Ok(_) => start_sampling(job, links, events).await,
         Err(failure) => Err(failure),
     };
     let switched_off = call(mode, links.ps445, events, format_args!("{PMT_OFF_WORD}")).await;
     let steps = swept?;
     switched_off?;
     Ok(steps)
+}
+
+async fn start_sampling(job: &Job, links: &Links<'_>, events: &Events) -> Result<u32, ScanFailure> {
+    if let Sampling::Integrate { ms } = job.plan.sampling {
+        call(job.mode, links.ps445, events, format_args!("{ms} {INTEGRATION_TIME_WORD}")).await?;
+        call(job.mode, links.ps445, events, format_args!("{INTEGRATE_WORD}")).await?;
+    }
+    sweep(job, links, events).await
 }
 
 async fn sweep(job: &Job, links: &Links<'_>, events: &Events) -> Result<u32, ScanFailure> {
@@ -693,12 +718,31 @@ async fn measure(job: &Job, nm: i32, links: &Links<'_>, events: &Events) -> Resu
     call(job.mode, links.spectradrive, events, format_args!("{} GOTO", Nm(nm))).await?;
     let mut row = String::new();
     write!(row, "{}", Nm(nm))?;
-    for _ in 0..job.plan.reads {
-        let output = call(job.mode, links.ps445, events, format_args!(".READ")).await?;
-        let value = parse_reading(&output).ok_or(ScanFailure::BadReading)?;
-        write!(row, ",{value}")?;
+    match job.plan.sampling {
+        Sampling::Reads(reads) => {
+            for _ in 0..reads {
+                let value = read_value(job.mode, links, events).await?;
+                write!(row, ",{value}")?;
+            }
+        }
+        Sampling::Integrate { ms } => {
+            settle(job.mode, ms).await;
+            let value = read_value(job.mode, links, events).await?;
+            write!(row, ",{value}")?;
+        }
     }
     Ok(row)
+}
+
+async fn read_value(mode: Mode, links: &Links<'_>, events: &Events) -> Result<i32, ScanFailure> {
+    let output = call(mode, links.ps445, events, format_args!("{READ_WORD}")).await?;
+    parse_reading(&output).ok_or(ScanFailure::BadReading)
+}
+
+async fn settle(mode: Mode, ms: i32) {
+    if mode == Mode::Live {
+        Timer::after(Duration::from_millis(u64::from(ms.unsigned_abs()) * SETTLE_WINDOWS)).await;
+    }
 }
 
 async fn call(mode: Mode, link: &Link, events: &Events, args: fmt::Arguments<'_>) -> Result<Text, ScanFailure> {
@@ -1001,31 +1045,24 @@ async fn write(console: &mut Console<'_>, data: &[u8]) -> Result<(), Disconnecte
 fn execute(links: &Links<'_>, line: &[u8]) -> Text {
     match split_command(line) {
         (b"dry-run", rest) => dry_run(links, rest),
-        _ => live(links, line),
-    }
-}
-
-fn live(links: &Links<'_>, line: &[u8]) -> Text {
-    match scan::parse(line, &SCAN_LIMITS) {
-        Err(ScanError::NotAScan) => run_command(links, line),
-        Ok(plan) => start_scan(links, Job { plan, mode: Mode::Live }),
-        Err(error) => formatted(format_args!("scan: {error}")),
+        _ => run_command(links, line),
     }
 }
 
 fn dry_run(links: &Links<'_>, line: &[u8]) -> Text {
-    match scan::parse(line, &SCAN_LIMITS) {
-        Err(ScanError::NotAScan) => dry_command(links, line),
-        Ok(plan) => start_scan(links, Job { plan, mode: Mode::Dry }),
-        Err(error) => formatted(format_args!("scan: {error}")),
-    }
-}
-
-fn dry_command(links: &Links<'_>, line: &[u8]) -> Text {
     match split_command(line) {
         (b"sd", command) => preview(links.spectradrive, command, links.unlocked.get()),
         (b"ps", command) => preview(links.ps445, command, links.unlocked.get()),
-        _ => reply(b"usage: dry-run sd|ps <command> | dry-run <scan>"),
+        _ => start_macro(links, line, Mode::Dry),
+    }
+}
+
+fn start_macro(links: &Links<'_>, line: &[u8], mode: Mode) -> Text {
+    match (scan::parse(line, &SCAN_LIMITS), mode) {
+        (Ok(plan), _) => start_scan(links, Job { plan, mode }),
+        (Err(ScanError::NotAScan), Mode::Live) => reply(b"unknown command"),
+        (Err(ScanError::NotAScan), Mode::Dry) => reply(b"usage: dry-run sd|ps <command> | dry-run <macro>"),
+        (Err(error), _) => formatted(format_args!("scan: {error}")),
     }
 }
 
@@ -1069,7 +1106,7 @@ fn run_command(links: &Links<'_>, line: &[u8]) -> Text {
         (b"sd" | b"ps", _) if links.scan.active.get() => reply(b"scan running, use abort scan"),
         (b"sd", command) => enqueue(links.spectradrive, command, links.unlocked.get()),
         (b"ps", command) => enqueue(links.ps445, command, links.unlocked.get()),
-        _ => reply(b"unknown command"),
+        _ => start_macro(links, line, Mode::Live),
     }
 }
 
