@@ -81,7 +81,7 @@ console commands go by name, everything else is parsed as a macro.
   as it is.
 
 Every macro ends with `PMT-OFF`, also when a step fails or the scan is aborted.
-Commands sent by a macro always go through the whitelist.
+Commands sent by a macro are part of the firmware and skip the whitelist.
 
 ```
 > dry-run 3 200.0 201.0 0.5 450 800 SCAN
@@ -101,10 +101,11 @@ devices' Forth input buffer holds 80.
 ## Safety model
 
 - **Whitelist:** each device has a list of allowed words with argument types.
-  Anything else is refused on the controller.
+  Anything else typed as `sd`/`ps` is refused on the controller. Macros and the
+  `status` queries are built into the firmware and are not checked against it.
 - **Unlock jumper (GP2 to GND):** `sd`/`ps` skip the whitelist and `goto` becomes
   available. The LED blinks red while it is closed. Opening it relocks immediately
-  and ends a running `goto`. Macros stay whitelisted regardless.
+  and ends a running `goto`.
 - **Line length:** lines over 79 characters are refused, jumper or not.
 
 This keeps the USB side from sending arbitrary commands. It does not protect

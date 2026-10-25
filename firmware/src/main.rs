@@ -72,7 +72,7 @@ const HELP: &str = concat!(
     "                        with the unlock jumper closed, sd/ps skip the whitelist\r\n",
     "  abort sd|ps|scan      stop waiting for a device, or stop the running macro\r\n",
     "  goto sd|ps            transparent link to a device, unlock jumper only; Ctrl-] leaves\r\n",
-    "  dry-run <command>     show what an sd, ps or macro command would send, send nothing\r\n",
+    "  dry-run <command>     show what an sd, ps, status or macro command would send\r\n",
     "\r\n",
     "macros\r\n",
     "  <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <integration-ms> SCAN\r\n",
@@ -87,7 +87,8 @@ const HELP: &str = concat!(
     "\r\n",
     "numbers\r\n",
     "  <int> 500   <dec> 300.5, exactly one digit after the point\r\n",
-    "  macros always pass the device whitelist, sd/ps unless the unlock jumper is closed\r\n",
+    "  typed sd/ps commands pass the whitelist unless the unlock jumper is closed;\r\n",
+    "  macros and status queries are built in and skip it\r\n",
     "  device lines are limited to 79 characters; split longer Forth over several commands\r\n",
 );
 
@@ -124,8 +125,8 @@ const INTEGRATE_WORD: &str = "INTEGRATE-START";
 const CURRENT_MODE_WORD: &str = "CURRENT";
 const SETTLE_WINDOWS: u64 = 2;
 const READ_WORD: &str = ".READ";
-const SPECTRADRIVE_STATUS_QUERIES: &[&[u8]] = &[b"?NM", b"?GRATING", b"STATE"];
-const PS445_STATUS_QUERIES: &[&[u8]] = &[];
+const SPECTRADRIVE_STATUS_QUERIES: &[&[u8]] = &[b"?NM", b"?GRATING", b"MONO-EESTATUS"];
+const PS445_STATUS_QUERIES: &[&[u8]] = &[b"READ-EESTATUS"];
 const PMT_ON_WORD: &str = "PMT-ON";
 const PMT_OFF_WORD: &str = "PMT-OFF";
 
@@ -261,7 +262,6 @@ impl Scan {
 }
 
 enum ScanFailure {
-    Rejected(Device),
     Unfinished(Device),
     BadReading,
     Overflow,
@@ -277,7 +277,6 @@ impl From<fmt::Error> for ScanFailure {
 impl fmt::Display for ScanFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ScanFailure::Rejected(device) => write!(f, "command rejected by {} whitelist", device.name()),
             ScanFailure::Unfinished(device) => write!(f, "{} command did not end with ok", device.name()),
             ScanFailure::BadReading => f.write_str("no number in .READ output"),
             ScanFailure::Overflow => f.write_str("line too long"),
@@ -746,22 +745,18 @@ async fn settle(mode: Mode, ms: i32) {
 }
 
 async fn call(mode: Mode, link: &Link, events: &Events, args: fmt::Arguments<'_>) -> Result<Text, ScanFailure> {
-    let command = scan_command(link, args)?;
+    let command = scan_command(args)?;
     match mode {
         Mode::Live => transact(link, &command).await,
         Mode::Dry => preview_call(link, events, &command).await,
     }
 }
 
-fn scan_command(link: &Link, args: fmt::Arguments<'_>) -> Result<String<128>, ScanFailure> {
+fn scan_command(args: fmt::Arguments<'_>) -> Result<String<128>, ScanFailure> {
     let mut command: String<128> = String::new();
     command.write_fmt(args)?;
     if !fits_device_line(command.as_bytes()) {
         return Err(ScanFailure::Overflow);
-    }
-    if check(command.as_bytes(), link.allowed).is_err() {
-        warn!("{} rejected scan command {=str}", link.device, command.as_str());
-        return Err(ScanFailure::Rejected(link.device));
     }
     Ok(command)
 }
@@ -1053,6 +1048,7 @@ fn dry_run(links: &Links<'_>, line: &[u8]) -> Text {
     match split_command(line) {
         (b"sd", command) => preview(links.spectradrive, command, links.unlocked.get()),
         (b"ps", command) => preview(links.ps445, command, links.unlocked.get()),
+        (b"status", _) => status(links, Mode::Dry),
         _ => start_macro(links, line, Mode::Dry),
     }
 }
@@ -1061,7 +1057,7 @@ fn start_macro(links: &Links<'_>, line: &[u8], mode: Mode) -> Text {
     match (scan::parse(line, &SCAN_LIMITS), mode) {
         (Ok(plan), _) => start_scan(links, Job { plan, mode }),
         (Err(ScanError::NotAScan), Mode::Live) => reply(b"unknown command"),
-        (Err(ScanError::NotAScan), Mode::Dry) => reply(b"usage: dry-run sd|ps <command> | dry-run <macro>"),
+        (Err(ScanError::NotAScan), Mode::Dry) => reply(b"usage: dry-run sd|ps <command> | dry-run status | dry-run <macro>"),
         (Err(error), _) => formatted(format_args!("scan: {error}")),
     }
 }
@@ -1089,7 +1085,7 @@ fn run_command(links: &Links<'_>, line: &[u8]) -> Text {
     match split_command(line) {
         (b"", _) => Text::new(),
         (b"nop", _) => reply(b"ok"),
-        (b"status", _) => status(links),
+        (b"status", _) => status(links, Mode::Live),
         (b"allowed", target) => match links.find(target) {
             Some(link) => allowed_words(link),
             None => reply(b"usage: allowed sd|ps"),
@@ -1205,7 +1201,7 @@ fn formatted(args: fmt::Arguments<'_>) -> Text {
     }
 }
 
-fn status(links: &Links<'_>) -> Text {
+fn status(links: &Links<'_>, mode: Mode) -> Text {
     let mut text: String<512> = String::new();
     for link in links.all() {
         if describe(link, &mut text).is_err() {
@@ -1239,31 +1235,59 @@ fn status(links: &Links<'_>) -> Text {
         (links.ps445, PS445_STATUS_QUERIES),
     ];
     for (link, queries) in remotes {
-        let outcome = query_remote(links, link, queries);
-        if write!(text, "remote {}: {outcome}\r\n", link.device.name()).is_err() {
+        if describe_remote(&mut text, links, link, queries, mode).is_err() {
             return reply(b"status overflow");
         }
     }
     reply(text.trim_end().as_bytes())
 }
 
-fn query_remote(links: &Links<'_>, link: &Link, queries: &[&[u8]]) -> &'static str {
+fn describe_remote(
+    text: &mut String<512>,
+    links: &Links<'_>,
+    link: &Link,
+    queries: &[&[u8]],
+    mode: Mode,
+) -> fmt::Result {
+    write!(text, "remote {}: ", link.device.name())?;
+    if let Some(reason) = remote_blocker(links, link, queries) {
+        return write!(text, "{reason}\r\n");
+    }
+    match mode {
+        Mode::Live => write!(text, "{}\r\n", send_queries(link, queries)),
+        Mode::Dry => preview_queries(text, queries),
+    }
+}
+
+fn remote_blocker(links: &Links<'_>, link: &Link, queries: &[&[u8]]) -> Option<&'static str> {
+    if queries.is_empty() {
+        return Some("nothing to query");
+    }
     if links.scan.active.get() {
-        return "scan running, not queried";
+        return Some("scan running, not queried");
     }
     if !link.is_idle() {
-        return "busy, not queried";
+        return Some("busy, not queried");
     }
+    None
+}
+
+fn send_queries(link: &Link, queries: &[&[u8]]) -> &'static str {
     for query in queries {
-        if check(query, link.allowed).is_err() {
-            return "status query not whitelisted, stopped";
-        }
         let line = Line::from_slice(query).expect("status queries fit a line");
         if link.requests.try_send(line).is_err() {
             return "queue full, partly queried";
         }
     }
     "queried, answers follow"
+}
+
+fn preview_queries(text: &mut String<512>, queries: &[&[u8]]) -> fmt::Result {
+    write!(text, "would send")?;
+    for query in queries {
+        write!(text, " {}", core::str::from_utf8(query).unwrap_or("<binary>"))?;
+    }
+    write!(text, "\r\n")
 }
 
 fn describe(link: &Link, text: &mut String<512>) -> core::fmt::Result {
