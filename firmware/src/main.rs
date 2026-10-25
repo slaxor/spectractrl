@@ -79,7 +79,7 @@ const HELP: &str = concat!(
     "      GRATING, VOLTS, CURRENT, PMT-ON, ITIME, INTEGRATE-START, then per step\r\n",
     "      GOTO, wait two integration windows, .READ,\r\n",
     "      one row \"nm,reading\" per step, PMT-OFF at the end, also on failure or abort\r\n",
-    "  <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN\r\n",
+    "  <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> MULTI-SCAN\r\n",
     "      like SCAN, but <reads> x .READ per step instead of an integration,\r\n",
     "      one row \"nm,reading,...\" per step\r\n",
     "  <grating> <nm> <reads> POINT-MEASURE\r\n",

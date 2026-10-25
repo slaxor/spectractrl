@@ -4,7 +4,7 @@ use core::ops::RangeInclusive;
 /// Wavelength in picometers; one nm is 1000 pm.
 pub type Picometers = i32;
 
-pub const RANGE_SCAN: &[u8] = b"RANGE-SCAN";
+pub const MULTI_SCAN: &[u8] = b"MULTI-SCAN";
 pub const POINT_MEASURE: &[u8] = b"POINT-MEASURE";
 pub const SCAN: &[u8] = b"SCAN";
 pub const MIN_STEP: Picometers = 100;
@@ -38,7 +38,7 @@ pub struct Limits<'a> {
 /// The macros the console understands, named by their last word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Macro {
-    RangeScan,
+    MultiScan,
     PointMeasure,
     Scan,
 }
@@ -46,7 +46,7 @@ pub enum Macro {
 impl Macro {
     fn from_word(word: &[u8]) -> Option<Self> {
         match word {
-            _ if word.eq_ignore_ascii_case(RANGE_SCAN) => Some(Macro::RangeScan),
+            _ if word.eq_ignore_ascii_case(MULTI_SCAN) => Some(Macro::MultiScan),
             _ if word.eq_ignore_ascii_case(POINT_MEASURE) => Some(Macro::PointMeasure),
             _ if word.eq_ignore_ascii_case(SCAN) => Some(Macro::Scan),
             _ => None,
@@ -55,7 +55,7 @@ impl Macro {
 
     fn arg_count(self) -> usize {
         match self {
-            Macro::RangeScan => 6,
+            Macro::MultiScan => 6,
             Macro::PointMeasure => 3,
             Macro::Scan => 6,
         }
@@ -63,8 +63,8 @@ impl Macro {
 
     fn usage(self) -> &'static str {
         match self {
-            Macro::RangeScan => {
-                "usage: <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN"
+            Macro::MultiScan => {
+                "usage: <grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> MULTI-SCAN"
             }
             Macro::PointMeasure => "usage: <grating> <nm> <reads> POINT-MEASURE",
             Macro::Scan => {
@@ -132,7 +132,7 @@ pub enum ScanError {
 /// Displays picometers as nm with one decimal, the only form the devices accept.
 pub struct Nm(pub Picometers);
 
-/// Parses `<grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> RANGE-SCAN`,
+/// Parses `<grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <reads> MULTI-SCAN`,
 /// `<grating> <start-nm> <end-nm> <step-nm> <pmt-volts> <integration-ms> SCAN`
 /// or `<grating> <nm> <reads> POINT-MEASURE` and validates it against `limits`.
 /// Commands ending in none of these words yield `ScanError::NotAScan`.
@@ -149,7 +149,7 @@ pub fn parse(command: &[u8], limits: &Limits<'_>) -> Result<Plan, ScanError> {
         *slot = token;
     }
     match kind {
-        Macro::RangeScan => range_scan(args, limits),
+        Macro::MultiScan => multi_scan(args, limits),
         Macro::PointMeasure => point_measure(args, limits),
         Macro::Scan => integrated_scan(args, limits),
     }
@@ -197,7 +197,7 @@ fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
     text.split(u8::is_ascii_whitespace).filter(|token| !token.is_empty())
 }
 
-fn range_scan(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError> {
+fn multi_scan(args: [&[u8]; MAX_ARGS], limits: &Limits<'_>) -> Result<Plan, ScanError> {
     let reads = within(integer(args[5], Field::Reads)?, Field::Reads, 1, MAX_READS)?;
     sweep(args, limits, Sampling::Reads(reads))
 }
@@ -332,8 +332,8 @@ mod tests {
     fn parse_cases() {
         let cases: &[(&str, &[u8], Result<Plan, ScanError>)] = &[
             ("not a scan", b"300.0 NM", Err(ScanError::NotAScan)),
-            ("valid", b"1 300.0 400.0 0.5 500 3 RANGE-SCAN", Ok(plan(300_000, 400_000, 500))),
-            ("integers as nm", b"1 300 400 1 500 3 range-scan", Ok(plan(300_000, 400_000, 1_000))),
+            ("valid", b"1 300.0 400.0 0.5 500 3 MULTI-SCAN", Ok(plan(300_000, 400_000, 500))),
+            ("integers as nm", b"1 300 400 1 500 3 multi-scan", Ok(plan(300_000, 400_000, 1_000))),
             (
                 "integrated scan",
                 b"1 300.0 400.0 0.5 500 250 scan",
@@ -356,8 +356,8 @@ mod tests {
             ),
             (
                 "missing argument",
-                b"1 300.0 400.0 0.5 500 RANGE-SCAN",
-                Err(ScanError::Usage(Macro::RangeScan)),
+                b"1 300.0 400.0 0.5 500 MULTI-SCAN",
+                Err(ScanError::Usage(Macro::MultiScan)),
             ),
             (
                 "point measure",
@@ -383,37 +383,37 @@ mod tests {
             ),
             (
                 "grating out of range",
-                b"3 300.0 400.0 0.5 500 3 RANGE-SCAN",
+                b"3 300.0 400.0 0.5 500 3 MULTI-SCAN",
                 Err(ScanError::OutOfRange { field: Field::Grating, low: 1, high: 2 }),
             ),
             (
                 "start below grating",
-                b"2 100.0 400.0 0.5 500 3 RANGE-SCAN",
+                b"2 100.0 400.0 0.5 500 3 MULTI-SCAN",
                 Err(ScanError::OutOfRange { field: Field::Start, low: 200_000, high: 1_400_000 }),
             ),
             (
                 "end before start",
-                b"1 400.0 300.0 0.5 500 3 RANGE-SCAN",
+                b"1 400.0 300.0 0.5 500 3 MULTI-SCAN",
                 Err(ScanError::OutOfRange { field: Field::End, low: 400_000, high: 1_000_000 }),
             ),
             (
                 "step zero",
-                b"1 300.0 400.0 0.0 500 3 RANGE-SCAN",
+                b"1 300.0 400.0 0.0 500 3 MULTI-SCAN",
                 Err(ScanError::OutOfRange { field: Field::Step, low: 100, high: 100_000 }),
             ),
             (
                 "two decimals",
-                b"1 300.25 400.0 0.5 500 3 RANGE-SCAN",
+                b"1 300.25 400.0 0.5 500 3 MULTI-SCAN",
                 Err(ScanError::BadNumber(Field::Start)),
             ),
             (
                 "volts out of range",
-                b"1 300.0 400.0 0.5 2000 3 RANGE-SCAN",
+                b"1 300.0 400.0 0.5 2000 3 MULTI-SCAN",
                 Err(ScanError::OutOfRange { field: Field::Volts, low: 0, high: 1000 }),
             ),
             (
                 "zero reads",
-                b"1 300.0 400.0 0.5 500 0 RANGE-SCAN",
+                b"1 300.0 400.0 0.5 500 0 MULTI-SCAN",
                 Err(ScanError::OutOfRange { field: Field::Reads, low: 1, high: 100 }),
             ),
         ];
